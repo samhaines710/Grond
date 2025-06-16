@@ -1,5 +1,3 @@
-# signal_generation.py
-
 import numpy as np
 import optuna
 from collections import defaultdict
