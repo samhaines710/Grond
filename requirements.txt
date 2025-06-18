@@ -11,7 +11,7 @@ prometheus_client
 pandas_market_calendars
 scikit-learn
 cvxpy
-pypfopt
+PyPortfolioOpt
 riskfolio-lib
 backtrader
 zipline-reloaded
