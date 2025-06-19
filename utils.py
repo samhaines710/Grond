@@ -410,4 +410,3 @@ def calculate_all_greeks(
         "color": color,
         "implied_volatility": sigma
     }
-```
