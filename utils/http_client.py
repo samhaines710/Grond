@@ -5,7 +5,7 @@ import requests
 from functools import wraps
 from logging_utils import write_status, REST_CALLS, REST_429
 from config import POLYGON_API_KEY
-
+from utils.logging_utils import write_status, REST_CALLS, REST_429
 # ─── Circuit Breaker ────────────────────────────────────────────────────────────
 class CircuitBreaker:
     def __init__(self, threshold=5, cooloff_secs=60):
