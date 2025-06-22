@@ -1,39 +1,79 @@
+# config.py
+
 import os
-from dotenv import load_dotenv
 import pytz
 
-# Load .env (for secrets only)
-load_dotenv()
+# === API KEYS & Tokens ===
+POLYGON_API_KEY        = os.getenv("POLYGON_API_KEY", "")
+TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def _get_env(name: str, required: bool = True, default=None):
-    val = os.getenv(name, default)
-    if required and not val:
-        raise EnvironmentError(f"Environment variable '{name}' is required but not set.")
-    return val
+# === Service Identity & Modes ===
+SERVICE_NAME           = os.getenv("SERVICE_NAME", "grond")
+EXECUTION_MODE         = os.getenv("EXECUTION_MODE", "SCALP")
+RISK_MODE              = os.getenv("RISK_MODE", "AGGRESSIVE")
 
-# ── Required Secrets ───────────────────────────────────────────────────────────
-POLYGON_API_KEY    = _get_env("POLYGON_API_KEY")
-TELEGRAM_BOT_TOKEN = _get_env("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = _get_env("TELEGRAM_CHAT_ID")
+# === Trading Parameters ===
+# How many contracts/shares per order
+ORDER_SIZE             = float(os.getenv("ORDER_SIZE", "1.0"))
+# ε for ε–greedy bandit in signal allocation
+BANDIT_EPSILON         = float(os.getenv("BANDIT_EPSILON", "0.1"))
 
-# ── Engine & Strategy Defaults (no env vars needed) ──────────────────────────
-from pricing_engines import EngineType
-PRICER_ENGINE   = EngineType.QUANTLIB.value    # always use QuantLib
-BANDIT_EPSILON  = 0.1                           # exploration rate
-ORDER_SIZE      = 1.0                           # default contract size
-EXECUTION_MODE  = "SIM"                         # manual/paper-only
+# === Underlying Symbols ===
+TICKERS                = [
+    "TSLA", "AAPL", "MSFT", "NVDA",
+    "NFLX", "AMZN", "META", "GOOG",
+    "CL",   "NG"
+]
+OPTIONS_TICKERS        = TICKERS.copy()
 
-# ── Dynamic Rate & Vol Settings ───────────────────────────────────────────────
-DEFAULT_RISK_FREE_TENOR           = "2year"    # yield‐curve tenor
-DEFAULT_VOLATILITY_LOOKBACK_DAYS = 30         # days for realized vol
+# === Timezone & Market-Hour Labels ===
+tz                     = pytz.timezone("US/Eastern")
+TIME_OF_DAY_LABELS     = (
+    "PRE_MARKET", "MORNING", "MIDDAY",
+    "AFTERNOON", "AFTER_HOURS", "OFF_HOURS"
+)
 
-# ── Monitoring & HTTP (use Render’s $PORT) ────────────────────────────────────
-SERVICE_NAME = "grond_app"
-PORT         = int(os.getenv("PORT", 8000))
-METRICS_PORT = PORT
-HTTP_PORT    = PORT
+# === Rate Limiting (Polygon API) ===
+RATE_LIMIT_PER_SEC     = 5.0
+BURST_CAPACITY_SEC     = 10
+RATE_LIMIT_PER_MIN     = 200.0
+BURST_CAPACITY_MIN     = 200
 
-# ── Symbols & Timezone ────────────────────────────────────────────────────────
-TICKERS         = ["TSLA","AAPL","MSFT","NVDA","NFLX","AMZN","META","GOOG","CL","NG"]
-OPTIONS_TICKERS = TICKERS.copy()
-tz              = pytz.timezone("US/Eastern")
+# === API & Logging File Paths ===
+SNAPSHOT_FILE          = "snapshots/options_oi_snapshots.json"
+SIGNAL_TRACKER_FILE    = "logs/alladin_signal_performance_log.csv"
+EXIT_LOG_FILE          = "logs/alladin_exit_log.csv"
+STATUS_FILE            = "logs/alladin_status.txt"
+
+# === Telegram Notifications ===
+ENABLE_TELEGRAM        = True
+TELEGRAM_COOLDOWN_SECONDS = 60
+
+# === Strategy & Classifier Parameters ===
+MIN_BREAKOUT_PROBABILITY = 0.5
+EXIT_BARS                = 3
+
+MOVEMENT_CONFIG_FILE      = "movement_config.json"
+MOVEMENT_LOGIC_CONFIG_FILE= "movement_logic_config.json"
+
+# === Data-Source & Ingestion Settings ===
+DATA_SOURCE_MODE       = "hybrid"   # "rest", "webhook", or "hybrid"
+REST_POLL_INTERVAL     = 10         # seconds between REST backfills
+WEBHOOK_INITIAL_DELAY  = 300        # seconds to wait before first webhook backfill
+
+# === Historical Lookbacks ===
+LOOKBACK_BREAKOUT      = 5   # bars to scan for breakout probability
+LOOKBACK_RISK_REWARD   = 20  # bars to compute ATR-based R/R
+DEFAULT_CANDLE_LIMIT   = 500
+
+# === TTL (time-to-live) Mappings ===
+TTL_MAP = {
+    "SHORT":  3,
+    "MEDIUM": 10,
+    "EXPIRY": 10000
+}
+
+# === Exit-Level Parameters ===
+EXIT_PROFIT_TARGET     = 0.02   # 2% profit target
+EXIT_STOP_LOSS         = -0.015 # –1.5% stop loss
