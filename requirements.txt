@@ -21,3 +21,4 @@ QuantLib-Python
 pytest
 flake8
 python-dotenv
+optuna
