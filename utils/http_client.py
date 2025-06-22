@@ -1,12 +1,14 @@
 # utils/http_client.py
 
 import time
+import os
 import requests
 from functools import wraps
-from logging_utils import write_status, REST_CALLS, REST_429
-from config import POLYGON_API_KEY
 from utils.logging_utils import write_status, REST_CALLS, REST_429
-# ─── Circuit Breaker ────────────────────────────────────────────────────────────
+
+# Load the Polygon API key from environment
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
+
 class CircuitBreaker:
     def __init__(self, threshold=5, cooloff_secs=60):
         self.fail_count   = 0
@@ -32,7 +34,6 @@ class CircuitBreaker:
 
 _circuit_breaker = CircuitBreaker()
 
-# ─── Token Bucket Rate Limiter ─────────────────────────────────────────────────
 class RateLimiter:
     def __init__(self, rate_per_sec, burst_sec, rate_per_min, burst_min):
         self.rate_sec  = rate_per_sec
@@ -43,21 +44,18 @@ class RateLimiter:
         self.cap_min   = burst_min
         self.tokens_m  = burst_min
         self.ts_m      = time.time()
-        self.lock      = None
 
     def acquire(self) -> bool:
         now = time.time()
-        # refill second‐bucket
         ds = now - self.ts_s
-        if ds>0:
-            self.tokens_s = min(self.cap_sec, self.tokens_s + ds*self.rate_sec)
+        if ds > 0:
+            self.tokens_s = min(self.cap_sec, self.tokens_s + ds * self.rate_sec)
             self.ts_s = now
-        # refill minute‐bucket
         dm = now - self.ts_m
-        if dm>0:
-            self.tokens_m = min(self.cap_min, self.tokens_m + dm*self.rate_min)
+        if dm > 0:
+            self.tokens_m = min(self.cap_min, self.tokens_m + dm * self.rate_min)
             self.ts_m = now
-        if self.tokens_s>=1 and self.tokens_m>=1:
+        if self.tokens_s >= 1 and self.tokens_m >= 1:
             self.tokens_s -= 1
             self.tokens_m -= 1
             return True
@@ -79,7 +77,6 @@ def rate_limited(func):
         return func(*args, **kwargs)
     return wrapper
 
-# ─── JSON Fetchers ──────────────────────────────────────────────────────────────
 @rate_limited
 def _get_json(url: str, ticker: str = "") -> dict:
     if _circuit_breaker.is_open():
@@ -96,9 +93,13 @@ def _get_json(url: str, ticker: str = "") -> dict:
         resp.raise_for_status()
         _circuit_breaker.record_success()
         return resp.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code in (500, 502, 503):
+            _circuit_breaker.record_failure()
+        write_status(f"HTTP error for {ticker}: {e}")
     except Exception as e:
         write_status(f"Request exception for {ticker}: {e}")
-        return {}
+    return {}
 
 def safe_fetch_polygon_data(url: str, ticker: str = "", retries: int = 3) -> dict:
     """
@@ -108,6 +109,6 @@ def safe_fetch_polygon_data(url: str, ticker: str = "", retries: int = 3) -> dic
         data = _get_json(url, ticker)
         if data:
             return data
-        time.sleep(2**attempt)
+        time.sleep(2 ** attempt)
     write_status(f"Failed to fetch data for {ticker} after {retries} attempts")
     return {}
