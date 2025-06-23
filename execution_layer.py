@@ -1,10 +1,9 @@
-import math
-import threading
+# execution_layer.py
+
 import logging
 from datetime import datetime
-from typing import Callable, Dict
+from typing import Any, Callable, Dict
 
-from data_ingestion import REALTIME_CANDLES, REALTIME_LOCK
 from utils import write_status
 
 logger = logging.getLogger("execution_layer")
@@ -88,21 +87,24 @@ class ManualExecutor:
         :return:       order report
         """
         report = {
-            "ticker":   ticker,
-            "side":     side.lower(),
-            "size":     size,
+            "ticker":    ticker,
+            "side":      side.lower(),
+            "size":      size,
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "note":     "Manual execution required"
+            "note":      "Manual execution required"
         }
 
-        # Log to console and status file
+        # Log locally
         msg = f"MANUAL EXECUTION → {side.upper()} {size} {ticker}"
         logger.info(msg)
         write_status(msg)
 
-        # Send Telegram notification if configured
+        # Send Telegram (or other) notification
         try:
-            text = f"📋 *MANUAL SIGNAL* — {side.upper()} {size} {ticker} @ {datetime.utcnow().strftime('%H:%M')} UTC"
+            text = (
+                f"📋 *MANUAL SIGNAL* — {side.upper()} {size} {ticker}"
+                f" @ {datetime.utcnow().strftime('%H:%M')} UTC"
+            )
             self.notify(text)
         except Exception as e:
             logger.warning(f"Failed to send notification: {e}")
