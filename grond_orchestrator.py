@@ -1,11 +1,10 @@
-# grond_orchestrator.py
+# src/grond_orchestrator.py
 
 import time
 import logging
 from datetime import datetime
 
 import numpy as np
-import pytz
 
 from config import (
     TICKERS,
@@ -24,25 +23,25 @@ from data_ingestion import (
     REALTIME_LOCK
 )
 from pricing_engines import DerivativesPricer
-from ml_classifier      import MLClassifier
-from strategy_logic     import StrategyLogic
-from signal_generation  import BanditAllocator
-from execution_layer    import ManualExecutor
+from ml_classifier import MLClassifier
+from strategy_logic import StrategyLogic
+from signal_generation import BanditAllocator
+from execution_layer import ManualExecutor
 
-from utils.logging_utils   import write_status
-from utils.calendar_utils  import calculate_time_of_day
-from utils.file_io         import append_signal_log
-from utils.http_client     import rate_limited
-from utils.greeks_helpers  import calculate_breakout_prob, calculate_recent_move_pct
-from utils.http_client     import safe_fetch_polygon_data   # if needed for on-the-fly calls
-from utils.statistics      import (  # you can pull these into a tiny stats module
+from utils import (
+    write_status,
+    reformat_candles,
+    calculate_breakout_prob,
+    calculate_recent_move_pct,
+    calculate_time_of_day,
     calculate_volume_ratio,
     compute_rsi,
     compute_corr_deviation,
     compute_skew_ratio,
-    detect_yield_spike
+    detect_yield_spike,
+    fetch_option_greeks,
+    append_signal_log,
 )
-from utils.pricing_helpers import fetch_option_greeks  # or keep it in greeks_helpers
 
 # ─── Prometheus metrics ─────────────────────────────────────────────────────────
 SIGNALS_PROCESSED = Counter(
@@ -85,25 +84,25 @@ class GrondOrchestrator:
             now = datetime.now(tz)
 
             for ticker in TICKERS:
-                # Pull current 5min bars from the shared deque
+                # Pull current 5m bars
                 with REALTIME_LOCK:
-                    bars = list(REALTIME_CANDLES.get(ticker, []))
-                if len(bars) < 5:
+                    raw = list(REALTIME_CANDLES.get(ticker, []))
+                if len(raw) < 5:
                     continue
 
+                bars      = reformat_candles(raw)
                 # Feature calculation
-                rets = [b for b in bars]  # already OHLCV dicts
-                breakout   = calculate_breakout_prob(rets)
-                recent_pct = calculate_recent_move_pct(ticker, rets)
-                vol_ratio  = calculate_volume_ratio(ticker, rets)
-                rsi        = compute_rsi(rets)
-                corr_dev   = compute_corr_deviation(ticker)
-                skew       = compute_skew_ratio(ticker)
-                ys2        = detect_yield_spike("2year")
-                ys10       = detect_yield_spike("10year")
-                ys30       = detect_yield_spike("30year")
-                tod        = calculate_time_of_day(now)
-                greeks     = fetch_option_greeks(ticker)
+                breakout  = calculate_breakout_prob(bars)
+                recent_pct= calculate_recent_move_pct(ticker, bars)
+                vol_ratio = calculate_volume_ratio(ticker, bars)
+                rsi       = compute_rsi(bars)
+                corr_dev  = compute_corr_deviation(ticker)
+                skew      = compute_skew_ratio(ticker)
+                ys2       = detect_yield_spike("2year")
+                ys10      = detect_yield_spike("10year")
+                ys30      = detect_yield_spike("30year")
+                tod       = calculate_time_of_day(now)
+                greeks    = fetch_option_greeks(ticker)
 
                 features = {
                     **greeks,
@@ -119,16 +118,15 @@ class GrondOrchestrator:
                     "time_of_day":        tod,
                 }
 
-                # Classification + exploration
-                cls_out  = self.classifier.classify(features)
-                base_mv  = cls_out["movement_type"]
-                mv       = (
+                # Classification + ε–greedy exploration
+                cls_out = self.classifier.classify(features)
+                base_mv = cls_out["movement_type"]
+                mv      = (
                     self.bandit.select_arm()
                     if np.random.rand() < BANDIT_EPSILON
                     else base_mv
                 )
 
-                # Strategy & execution
                 context = {**features, **cls_out}
                 strat   = self.logic.execute_strategy(mv, context)
                 SIGNALS_PROCESSED.labels(
@@ -144,11 +142,10 @@ class GrondOrchestrator:
                         side=side
                     )
                     EXECUTIONS.labels(
-                        ticker=ticker,
-                        action=action
+                        ticker=ticker, action=action
                     ).inc()
 
-                    # Optionally log to CSV
+                    # Log to CSV
                     append_signal_log({
                         "time": now.isoformat(),
                         "ticker": ticker,
@@ -157,7 +154,7 @@ class GrondOrchestrator:
                         **greeks
                     })
 
-            # Sleep to align with 5m bars
+            # Sleep until next 5m bar
             time.sleep(300)
 
 
