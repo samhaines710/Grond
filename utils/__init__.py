@@ -28,7 +28,6 @@ from .analysis import (
     calculate_signal_persistence,
     calculate_reversal_and_scope,
     calculate_risk_reward,
-    calculate_market_trend,
     calculate_time_of_day,
     calculate_volume_ratio,
     compute_skew_ratio,
