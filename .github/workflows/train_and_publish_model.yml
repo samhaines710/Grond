@@ -1,0 +1,45 @@
+name: Train & Publish Model
+
+on:
+  push:
+    paths:
+      - 'train_ml_classifier.py'
+      - 'data/**'
+      - '.github/workflows/train_and_publish_model.yml'
+
+jobs:
+  train-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Train model pipeline
+        run: |
+          python train_ml_classifier.py \
+            --train-csv data/movement_training_data.csv \
+            --label-col movement_type \
+            --model-dir models \
+            --model-filename xgb_classifier.pipeline.joblib
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload model artifact to S3
+        run: |
+          aws s3 cp \
+            models/xgb_classifier.pipeline.joblib \
+            s3://${{ secrets.S3_BUCKET }}/models/xgb_classifier.pipeline.joblib
