@@ -1,3 +1,5 @@
+# src/utils/http_client.py
+
 import time
 import math
 import threading
@@ -151,7 +153,7 @@ def fetch_option_greeks(
                 "implied_volatility": opt.get("implied_volatility", 0.0),
             }
 
-    # 2) Fallback: realized-volatility sigma (pull bars from utils.market_data)
+    # 2) Fallback: realized-volatility sigma
     from utils.market_data import REALTIME_CANDLES
 
     with threading.Lock():
