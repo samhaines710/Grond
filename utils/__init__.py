@@ -1,20 +1,18 @@
-# utils/__init__.py
-
-# ─── Logging & Status Writes ────────────────────────────────────────────────────
+# ─── Logging & status writes ────────────────────────────────────────────────────
 from .logging_utils import (
     write_status,
     REST_CALLS,
     REST_429,
 )
 
-# ─── HTTP Client & Rate Limiting ───────────────────────────────────────────────
+# ─── HTTP client & rate limiting ───────────────────────────────────────────────
 from .http_client import (
     safe_fetch_polygon_data,
     rate_limited,
     fetch_option_greeks,
 )
 
-# ─── Market-Data Utilities ─────────────────────────────────────────────────────
+# ─── Market‐data utilities ─────────────────────────────────────────────────────
 from .market_data import (
     reformat_candles,
     fetch_premarket_early_data,
@@ -23,13 +21,14 @@ from .market_data import (
     fetch_historical_5m_candles,
 )
 
-# ─── Core Indicators & Analysis ────────────────────────────────────────────────
+# ─── Core indicators & analysis ────────────────────────────────────────────────
 from .analysis import (
     calculate_breakout_prob,
     calculate_recent_move_pct,
     calculate_signal_persistence,
     calculate_reversal_and_scope,
     calculate_risk_reward,
+    calculate_market_trend,
     calculate_time_of_day,
     calculate_volume_ratio,
     compute_skew_ratio,
@@ -38,19 +37,14 @@ from .analysis import (
     detect_yield_spike,
 )
 
-# ─── Calendar Helpers ──────────────────────────────────────────────────────────
-from .calendar_utils import (
-    is_market_open_today,
-)
-
-# ─── File I/O Helpers ──────────────────────────────────────────────────────────
+# ─── File I/O helpers ──────────────────────────────────────────────────────────
 from .file_io import (
     append_signal_log,
     load_snapshot,
     save_snapshot,
 )
 
-# ─── Greeks Helpers ────────────────────────────────────────────────────────────
+# ─── Greeks & Pricing helpers ──────────────────────────────────────────────────
 from .greeks_helpers import (
     calculate_all_greeks,
 )
