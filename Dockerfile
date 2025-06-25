@@ -1,36 +1,26 @@
-# 1) Use a slim Python base image
+# Use a slim Python 3.10 base image
 FROM python:3.10-slim
 
-# 2) Prevent interactive prompts during apt installs
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+# Set an env var for overrideable model path
+ENV ML_MODEL_PATH=/app/models/xgb_classifier.pipeline.joblib
 
-# 3) Install system libraries for QuantLib, linear algebra, Zipline, CVX/Ecos, etc.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        libquantlib0-dev \
-        libblas-dev \
-        liblapack-dev \
-        libssl-dev \
-        libcurl4-openssl-dev \
-        gfortran \
-        git \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# 4) Create and switch to the app directory
+# Create and switch to app directory
 WORKDIR /app
 
-# 5) Copy and install Python dependencies
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip \
-    && pip install --no-cache-dir -r /app/requirements.txt
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 6) Copy the rest of your application code
-COPY . /app
+# Copy application source
+COPY . .
 
-# 7) Expose your main HTTP port (Flask + Prometheus)
-EXPOSE 10000 8000
+# Copy the pre-trained model artifact into the image
+# (Make sure your local repo has models/xgb_classifier.pipeline.joblib)
+COPY models/xgb_classifier.pipeline.joblib /app/models/xgb_classifier.pipeline.joblib
 
-# 8) Default command: run the main orchestrator loop
+# (Optional) Expose Prometheus and HTTP ports
+EXPOSE 8000
+EXPOSE 10000
+
+# Launch the orchestrator
 CMD ["python", "grond_orchestrator.py"]
