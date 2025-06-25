@@ -29,9 +29,8 @@ RUN pip install --upgrade pip \
 # 6) Copy the rest of your application code
 COPY . /app
 
-# 7) Expose whichever port your web service or trigger app listens on
-EXPOSE 10000
+# 7) Expose your main HTTP port (Flask + Prometheus)
+EXPOSE 10000 8000
 
 # 8) Default command: run the main orchestrator loop
-#    If you instead need to launch a Flask/Gunicorn app, swap this line accordingly.
 CMD ["python", "grond_orchestrator.py"]
