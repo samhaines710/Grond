@@ -1,19 +1,20 @@
 # utils/__init__.py
 
-# ─── Logging & status writes ────────────────────────────────────────────────────
+# ─── Logging & Status Writes ────────────────────────────────────────────────────
 from .logging_utils import (
     write_status,
     REST_CALLS,
     REST_429,
 )
 
-# ─── HTTP client & rate limiting ───────────────────────────────────────────────
+# ─── HTTP Client & Rate Limiting ───────────────────────────────────────────────
 from .http_client import (
     safe_fetch_polygon_data,
     rate_limited,
+    fetch_option_greeks,
 )
 
-# ─── Market‐data utilities ─────────────────────────────────────────────────────
+# ─── Market-Data Utilities ─────────────────────────────────────────────────────
 from .market_data import (
     reformat_candles,
     fetch_premarket_early_data,
@@ -22,7 +23,7 @@ from .market_data import (
     fetch_historical_5m_candles,
 )
 
-# ─── Core indicators & analysis ────────────────────────────────────────────────
+# ─── Core Indicators & Analysis ────────────────────────────────────────────────
 from .analysis import (
     calculate_breakout_prob,
     calculate_recent_move_pct,
@@ -37,15 +38,19 @@ from .analysis import (
     detect_yield_spike,
 )
 
-# ─── File I/O helpers ──────────────────────────────────────────────────────────
+# ─── Calendar Helpers ──────────────────────────────────────────────────────────
+from .calendar_utils import (
+    is_market_open_today,
+)
+
+# ─── File I/O Helpers ──────────────────────────────────────────────────────────
 from .file_io import (
     append_signal_log,
     load_snapshot,
     save_snapshot,
 )
 
-# ─── Greeks & Pricing helpers ──────────────────────────────────────────────────
+# ─── Greeks Helpers ────────────────────────────────────────────────────────────
 from .greeks_helpers import (
     calculate_all_greeks,
-    fetch_option_greeks,
 )
