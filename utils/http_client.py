@@ -1,8 +1,8 @@
-# src/utils/http_client.py
-
 import time
 import math
 import threading
+import logging
+from datetime import datetime
 from typing import Any, Callable, Dict
 
 import requests
@@ -10,7 +10,6 @@ import requests
 from config import POLYGON_API_KEY, DEFAULT_VOLATILITY_FALLBACK
 from utils.logging_utils import write_status, REST_CALLS, REST_429
 from utils.greeks_helpers import calculate_all_greeks
-from data_ingestion import REALTIME_CANDLES, REALTIME_LOCK
 
 # ─── Circuit breaker ────────────────────────────────────────────────────────────
 class CircuitBreaker:
@@ -41,11 +40,11 @@ breaker = CircuitBreaker()
 # ─── Rate limiter ────────────────────────────────────────────────────────────────
 class RateLimiter:
     def __init__(self, rate_per_sec: float, burst_sec: int):
-        self.rate      = rate_per_sec
-        self.cap       = burst_sec
-        self.tokens    = burst_sec
-        self.timestamp = time.time()
-        self.lock      = threading.Lock()
+        self.rate       = rate_per_sec
+        self.cap        = burst_sec
+        self.tokens     = burst_sec
+        self.timestamp  = time.time()
+        self.lock       = threading.Lock()
 
     def acquire(self) -> bool:
         with self.lock:
@@ -111,9 +110,10 @@ def fetch_option_greeks(
     typ: str = "call"
 ) -> Dict[str, Any]:
     """
-    Try Polygon snapshot for `typ` near-ATM option; fallback to realized-volatility.
+    Try Polygon snapshot for the given `typ` ("call" or "put") near-ATM option;
+    fallback to realized-volatility Black-Scholes greeks if needed.
     """
-    # 1) Polygon snapshot
+    # 1) Attempt Polygon snapshot
     url     = f"https://api.polygon.io/v3/snapshot/options/{ticker}?apiKey={POLYGON_API_KEY}"
     results = safe_fetch_polygon_data(url, ticker).get("results", [])
 
@@ -123,30 +123,38 @@ def fetch_option_greeks(
             if o.get("details", {}).get("contract_type", "").lower() == typ
         ]
         candidates = same_type or results
-        opt = min(candidates, key=lambda o: abs(
-            o["details"]["strike_price"] - o["underlying_asset"]["price"]
-        ))
+
+        # Pick ATM (closest strike)
+        opt = min(
+            candidates,
+            key=lambda o: abs(
+                o["details"]["strike_price"]
+                - o["underlying_asset"]["price"]
+            )
+        )
         pg = opt.get("greeks", {})
         if pg:
             write_status(f"Used Polygon {typ} Greeks for {ticker}")
             return {
-                "delta":               pg.get("delta", 0.0),
-                "gamma":               pg.get("gamma", 0.0),
-                "theta":               pg.get("theta", 0.0),
-                "vega":                pg.get("vega", 0.0),
-                "rho":                 pg.get("rho", 0.0),
-                "vanna":               pg.get("vanna", 0.0),
-                "vomma":               pg.get("vomma", 0.0),
-                "charm":               pg.get("charm", 0.0),
-                "veta":                pg.get("veta", 0.0),
-                "speed":               pg.get("speed", 0.0),
-                "zomma":               pg.get("zomma", 0.0),
-                "color":               pg.get("color", 0.0),
-                "implied_volatility":  opt.get("implied_volatility", 0.0),
+                "delta": pg.get("delta", 0.0),
+                "gamma": pg.get("gamma", 0.0),
+                "theta": pg.get("theta", 0.0),
+                "vega":  pg.get("vega", 0.0),
+                "rho":   pg.get("rho", 0.0),
+                "vanna": pg.get("vanna", 0.0),
+                "vomma": pg.get("vomma", 0.0),
+                "charm": pg.get("charm", 0.0),
+                "veta":  pg.get("veta", 0.0),
+                "speed": pg.get("speed", 0.0),
+                "zomma": pg.get("zomma", 0.0),
+                "color": pg.get("color", 0.0),
+                "implied_volatility": opt.get("implied_volatility", 0.0),
             }
 
-    # 2) Fallback: realized-volatility greeks
-    with REALTIME_LOCK:
+    # 2) Fallback: realized-volatility sigma (pull bars from utils.market_data)
+    from utils.market_data import REALTIME_CANDLES
+
+    with threading.Lock():
         bars = list(REALTIME_CANDLES.get(ticker, []))
 
     sigma = DEFAULT_VOLATILITY_FALLBACK
