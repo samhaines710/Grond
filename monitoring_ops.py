@@ -1,5 +1,6 @@
 # monitoring_ops.py
 
+import errno
 import logging
 import threading
 from datetime import datetime
@@ -14,6 +15,10 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST
 )
 from config import METRICS_PORT, HTTP_PORT, SERVICE_NAME
+
+# ── Module-level flags to enforce idempotency ─────────────────────────────────
+_metrics_server_started = False
+_http_server_started   = False
 
 # ── Structured Logging ─────────────────────────────────────────────────────────
 def setup_logging():
@@ -70,19 +75,47 @@ def health():
 # ── Startup ─────────────────────────────────────────────────────────────────────
 def start_monitoring_server():
     """
-    1) launch Prometheus on METRICS_PORT
-    2) launch Flask on HTTP_PORT for /metrics and /health
+    1) launch Prometheus on METRICS_PORT (once, swallow EADDRINUSE)
+    2) launch Flask on HTTP_PORT for /metrics and /health (once)
     """
+    global _metrics_server_started, _http_server_started
+
     setup_logging()
+    logger = logging.getLogger("monitoring_ops")
 
-    # 1) Prometheus metrics endpoint (if you ever scrape via the client library)
-    logging.getLogger("monitoring_ops").info(f"Starting Prometheus server on port {METRICS_PORT}")
-    start_http_server(METRICS_PORT)
+    # 1) Prometheus metrics endpoint
+    if not _metrics_server_started:
+        logger.info(f"Starting Prometheus metrics server on port {METRICS_PORT}")
+        try:
+            start_http_server(METRICS_PORT)
+            _metrics_server_started = True
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.EADDRINUSE:
+                logger.warning(
+                    f"Metrics port {METRICS_PORT} already in use; skipping metrics server start."
+                )
+                _metrics_server_started = True
+            else:
+                logger.error(
+                    f"Failed to start Prometheus server on port {METRICS_PORT}: {e!r}"
+                )
+                raise
+    else:
+        logger.debug("Prometheus metrics server already started; skipping.")
 
-    # 2) HTTP server for both /metrics (redundant) and /health
-    logging.getLogger("monitoring_ops").info(f"Starting HTTP health & metrics on port {HTTP_PORT}")
-    thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False),
-        daemon=True
-    )
-    thread.start()
+    # 2) HTTP server for /metrics and /health
+    if not _http_server_started:
+        logger.info(f"Starting Flask health & metrics server on port {HTTP_PORT}")
+        thread = threading.Thread(
+            target=lambda: app.run(
+                host="0.0.0.0",
+                port=HTTP_PORT,
+                debug=False,
+                use_reloader=False
+            ),
+            daemon=True
+        )
+        thread.start()
+        _http_server_started = True
+    else:
+        logger.debug("Flask HTTP server already started; skipping.")
