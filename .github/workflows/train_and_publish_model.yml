@@ -1,8 +1,9 @@
-name: Train & Publish Model
+name: Generate Data, Train & Publish Model
 
 on:
   push:
     paths:
+      - 'prepare_training_data.py'
       - 'train_ml_classifier.py'
       - 'data/**'
       - '.github/workflows/train_and_publish_model.yml'
@@ -10,6 +11,7 @@ on:
 jobs:
   train-and-upload:
     runs-on: ubuntu-latest
+    environment: CI              # ← pull secrets from your CI environment
 
     steps:
       - name: Checkout repository
@@ -23,20 +25,33 @@ jobs:
       - name: Install dependencies
         run: pip install --no-cache-dir -r requirements.txt
 
-      - name: Train model pipeline
+      - name: Prepare training data
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: |
-          python train_ml_classifier.py \
-            --train-csv data/movement_training_data.csv \
-            --label-col movement_type \
-            --model-dir models \
-            --model-filename xgb_classifier.pipeline.joblib
+          mkdir -p data
+          python prepare_training_data.py
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Upload training CSV to S3
+        run: |
+          aws s3 cp \
+            data/movement_training_data.csv \
+            s3://${{ secrets.S3_BUCKET }}/data/movement_training_data.csv
+
+      - name: Train model pipeline
+        run: |
+          python train_ml_classifier.py \
+            --train-csv   data/movement_training_data.csv \
+            --label-col   movement_type \
+            --model-dir   models \
+            --model-filename xgb_classifier.pipeline.joblib
 
       - name: Upload model artifact to S3
         run: |
