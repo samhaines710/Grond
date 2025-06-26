@@ -46,7 +46,9 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
         "close":     b["c"],
         "volume":    b["v"]
     } for b in raw_bars])
-    df["dt"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize('UTC').dt.tz_convert(tz)
+    df["dt"] = pd.to_datetime(df["timestamp"], unit="ms") \
+                   .dt.tz_localize('UTC') \
+                   .dt.tz_convert(tz)
     df.set_index("dt", inplace=True)
 
     records = []
@@ -58,9 +60,11 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
         # compute feature metrics
         candles    = window.reset_index().to_dict("records")
         breakout   = calculate_breakout_prob(candles)
-        rec_move   = calculate_recent_move_pct(symbol, candles)
+        # calculate_recent_move_pct now takes only the candles list
+        rec_move   = calculate_recent_move_pct(candles)
         tod        = calculate_time_of_day(current.name)
-        vol_ratio  = calculate_volume_ratio(symbol, candles)
+        # calculate_volume_ratio now takes only the candles list
+        vol_ratio  = calculate_volume_ratio(candles)
         rsi        = compute_rsi(candles)
         corr_dev   = compute_corr_deviation(symbol)
         skew_ratio = compute_skew_ratio(symbol)
@@ -70,15 +74,15 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
         greeks     = fetch_option_greeks(symbol)
 
         feat = {
-            "symbol": symbol,
-            "breakout_prob": breakout,
+            "symbol":         symbol,
+            "breakout_prob":  breakout,
             "recent_move_pct": rec_move,
-            "time_of_day": tod,
-            "volume_ratio": vol_ratio,
-            "rsi": rsi,
-            "corr_dev": corr_dev,
-            "skew_ratio": skew_ratio,
-            "yield_spike_2year": ys2,
+            "time_of_day":    tod,
+            "volume_ratio":   vol_ratio,
+            "rsi":            rsi,
+            "corr_dev":       corr_dev,
+            "skew_ratio":     skew_ratio,
+            "yield_spike_2year":  ys2,
             "yield_spike_10year": ys10,
             "yield_spike_30year": ys30,
             **greeks
@@ -106,6 +110,7 @@ def main():
         all_dfs.append(extract_features_and_label(ticker))
 
     full = pd.concat(all_dfs, ignore_index=True)
+    # shuffle the rows to avoid any timezone or ticker ordering biases
     full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
     full.to_csv(OUTPUT_PATH, index=False)
     print(f"✅ Saved {len(full)} rows to {OUTPUT_PATH}")
