@@ -3,14 +3,13 @@
 
 import os
 import logging
+import requests
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 
 from config import TICKERS, tz
 from data_ingestion import HistoricalDataLoader
 from utils import (
-    reformat_candles,
     calculate_breakout_prob,
     calculate_recent_move_pct,
     calculate_time_of_day,
@@ -18,7 +17,6 @@ from utils import (
     compute_rsi,
     compute_corr_deviation,
     compute_skew_ratio,
-    detect_yield_spike,
     fetch_option_greeks
 )
 
@@ -29,42 +27,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Safe yield spike helper ────────────────────────────────────────────────────
-def safe_detect_yield_spike(term: str) -> float:
-    """
-    Wrap detect_yield_spike to catch 404s or other errors and return 0.0 on failure.
-    """
-    try:
-        return detect_yield_spike(term)
-    except Exception as e:
-        logger.warning(f'"Request error for {term}": {e}. Using fallback 0.0')
-        return 0.0
+# ─── Fetch Treasury Yields ─────────────────────────────────────────────────────
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
+YIELDS_ENDPOINT = "https://api.polygon.io/fed/v1/treasury-yields"
 
-# ─── Output path ────────────────────────────────────────────────────────────────
+def fetch_treasury_yields(date: str = None) -> dict:
+    """
+    Calls Polygon's treasury-yields endpoint once and returns a dict
+    mapping 'yield_2_year', 'yield_10_year', 'yield_30_year', etc.
+    """
+    params = {"apiKey": POLYGON_API_KEY}
+    if date:
+        params["date"] = date
+    resp = requests.get(YIELDS_ENDPOINT, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json().get("results", [])
+    if not data:
+        logger.warning(f'"No yield data returned for date={date}"')
+        return {}
+    record = data[0]
+    logger.info(f'"Fetched treasury yields for date={record.get("date")}"')
+    return record
+
+# Cache the yields once per run
+YIELDS = fetch_treasury_yields()
+
+# ─── Output Configuration ───────────────────────────────────────────────────────
 OUTPUT_DIR  = "data"
 OUTPUT_FILE = "movement_training_data.csv"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
 
-# ─── Parameters ────────────────────────────────────────────────────────────────
-HIST_DAYS      = 30
+# ─── Parameters (allow CI override) ────────────────────────────────────────────
+HIST_DAYS      = int(os.getenv("HIST_DAYS", 30))
 LOOKBACK_BARS  = 12
 LOOKAHEAD_BARS = 1
 
 def extract_features_and_label(symbol: str) -> pd.DataFrame:
-    # 1) Fetch 30 days of 5m bars
+    # 1) Load OHLC bars
     end   = datetime.now(tz)
     start = end - timedelta(days=HIST_DAYS)
-    loader     = HistoricalDataLoader()
-    raw_bars   = loader.fetch_bars(symbol, start, end)
-    logger.info(f'"Fetched {len(raw_bars)} historical bars for {symbol}"')
+    loader   = HistoricalDataLoader()
+    raw_bars = loader.fetch_bars(symbol, start, end)
+    logger.info(f'"Fetched {len(raw_bars)} bars for {symbol} over {HIST_DAYS} days"')
 
-    # 2) Build DataFrame
-    df = pd.DataFrame([
-        {"timestamp": b["t"], "open": b["o"], "high": b["h"],
-         "low": b["l"], "close": b["c"], "volume": b["v"]}
-        for b in raw_bars
-    ])
+    # 2) Frame into DataFrame with datetime index
+    df = pd.DataFrame([{
+        "timestamp": b["t"],
+        "open":      b["o"],
+        "high":      b["h"],
+        "low":       b["l"],
+        "close":     b["c"],
+        "volume":    b["v"]
+    } for b in raw_bars])
     df["dt"] = (
         pd.to_datetime(df["timestamp"], unit="ms")
           .dt.tz_localize("UTC")
@@ -72,53 +87,39 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
     )
     df.set_index("dt", inplace=True)
 
+    # 3) Hoist yield and Greeks outside loop
+    ys2  = float(YIELDS.get("yield_2_year", 0.0))
+    ys10 = float(YIELDS.get("yield_10_year", 0.0))
+    ys30 = float(YIELDS.get("yield_30_year", 0.0))
+    greeks = fetch_option_greeks(symbol)
+    logger.info(f'"Using yields (2y={ys2},10y={ys10},30y={ys30}) and Greeks for {symbol}"')
+
     records = []
-    # 3) Slide window to compute features + label
+    # 4) Slide window to compute features + label
     for i in range(LOOKBACK_BARS, len(df) - LOOKAHEAD_BARS):
         window  = df.iloc[i-LOOKBACK_BARS : i]
         current = df.iloc[i]
-
-        candles   = window.reset_index().to_dict("records")
-        breakout  = calculate_breakout_prob(candles)
-        rec_move  = calculate_recent_move_pct(candles)        # was two args, now one
-        tod       = calculate_time_of_day(current.name)
-        vol_ratio = calculate_volume_ratio(candles)           # was two args, now one
-        rsi       = compute_rsi(candles)
-        corr_dev  = compute_corr_deviation(symbol)
-        skew_ratio= compute_skew_ratio(symbol)
-
-        # safe yield spikes
-        ys2  = safe_detect_yield_spike("2year")
-        ys10 = safe_detect_yield_spike("10year")
-        ys30 = safe_detect_yield_spike("30year")
-
-        greeks = fetch_option_greeks(symbol)
+        candles = window.reset_index().to_dict("records")
 
         feat = {
-            "symbol": symbol,
-            "breakout_prob": breakout,
-            "recent_move_pct": rec_move,
-            "time_of_day": tod,
-            "volume_ratio": vol_ratio,
-            "rsi": rsi,
-            "corr_dev": corr_dev,
-            "skew_ratio": skew_ratio,
+            "symbol":          symbol,
+            "breakout_prob":   calculate_breakout_prob(candles),
+            "recent_move_pct": calculate_recent_move_pct(candles),
+            "time_of_day":     calculate_time_of_day(current.name),
+            "volume_ratio":    calculate_volume_ratio(candles),
+            "rsi":             compute_rsi(candles),
+            "corr_dev":        compute_corr_deviation(symbol),
+            "skew_ratio":      compute_skew_ratio(symbol),
             "yield_spike_2year":  ys2,
             "yield_spike_10year": ys10,
             "yield_spike_30year": ys30,
             **greeks
         }
 
-        # 4) Label: next bar's return
+        # 5) Label next bar’s return
         next_bar = df.iloc[i + LOOKAHEAD_BARS]
-        move_pct = (next_bar["close"] - current["close"]) / current["close"]
-        if move_pct > 0:
-            label = "CALL"
-        elif move_pct < 0:
-            label = "PUT"
-        else:
-            label = "NEUTRAL"
-        feat["movement_type"] = label
+        delta = (next_bar["close"] - current["close"]) / current["close"]
+        feat["movement_type"] = "CALL" if delta > 0 else ("PUT" if delta < 0 else "NEUTRAL")
 
         records.append(feat)
 
@@ -127,8 +128,9 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
 def main():
     all_dfs = []
     for ticker in TICKERS:
-        logger.info(f'"Generating data for {ticker}…"')
-        all_dfs.append(extract_features_and_label(ticker))
+        logger.info(f'"Generating data for {ticker}"')
+        df_ticker = extract_features_and_label(ticker)
+        all_dfs.append(df_ticker)
 
     full = pd.concat(all_dfs, ignore_index=True)
     full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
