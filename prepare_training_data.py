@@ -1,6 +1,8 @@
+#!/usr/bin/env python3
 # prepare_training_data.py
 
 import os
+import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -20,12 +22,31 @@ from utils import (
     fetch_option_greeks
 )
 
+# ─── Logging Setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","module":"%(module)s","message":%(message)s}'
+)
+logger = logging.getLogger(__name__)
+
+# ─── Safe yield spike helper ────────────────────────────────────────────────────
+def safe_detect_yield_spike(term: str) -> float:
+    """
+    Wrap detect_yield_spike to catch 404s or other errors and return 0.0 on failure.
+    """
+    try:
+        return detect_yield_spike(term)
+    except Exception as e:
+        logger.warning(f'"Request error for {term}": {e}. Using fallback 0.0')
+        return 0.0
+
+# ─── Output path ────────────────────────────────────────────────────────────────
 OUTPUT_DIR  = "data"
 OUTPUT_FILE = "movement_training_data.csv"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
 
-# How many days to pull, and lookback/lookahead sizes
+# ─── Parameters ────────────────────────────────────────────────────────────────
 HIST_DAYS      = 30
 LOOKBACK_BARS  = 12
 LOOKAHEAD_BARS = 1
@@ -34,54 +55,54 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
     # 1) Fetch 30 days of 5m bars
     end   = datetime.now(tz)
     start = end - timedelta(days=HIST_DAYS)
-    loader = HistoricalDataLoader()
-    raw_bars = loader.fetch_bars(symbol, start, end)
+    loader     = HistoricalDataLoader()
+    raw_bars   = loader.fetch_bars(symbol, start, end)
+    logger.info(f'"Fetched {len(raw_bars)} historical bars for {symbol}"')
 
     # 2) Build DataFrame
-    df = pd.DataFrame([{
-        "timestamp": b["t"],
-        "open":      b["o"],
-        "high":      b["h"],
-        "low":       b["l"],
-        "close":     b["c"],
-        "volume":    b["v"]
-    } for b in raw_bars])
-    df["dt"] = pd.to_datetime(df["timestamp"], unit="ms") \
-                   .dt.tz_localize('UTC') \
-                   .dt.tz_convert(tz)
+    df = pd.DataFrame([
+        {"timestamp": b["t"], "open": b["o"], "high": b["h"],
+         "low": b["l"], "close": b["c"], "volume": b["v"]}
+        for b in raw_bars
+    ])
+    df["dt"] = (
+        pd.to_datetime(df["timestamp"], unit="ms")
+          .dt.tz_localize("UTC")
+          .dt.tz_convert(tz)
+    )
     df.set_index("dt", inplace=True)
 
     records = []
     # 3) Slide window to compute features + label
     for i in range(LOOKBACK_BARS, len(df) - LOOKAHEAD_BARS):
-        window  = df.iloc[i-LOOKBACK_BARS:i]
+        window  = df.iloc[i-LOOKBACK_BARS : i]
         current = df.iloc[i]
 
-        # compute feature metrics
-        candles    = window.reset_index().to_dict("records")
-        breakout   = calculate_breakout_prob(candles)
-        # calculate_recent_move_pct now takes only the candles list
-        rec_move   = calculate_recent_move_pct(candles)
-        tod        = calculate_time_of_day(current.name)
-        # calculate_volume_ratio now takes only the candles list
-        vol_ratio  = calculate_volume_ratio(candles)
-        rsi        = compute_rsi(candles)
-        corr_dev   = compute_corr_deviation(symbol)
-        skew_ratio = compute_skew_ratio(symbol)
-        ys2        = detect_yield_spike("2year")
-        ys10       = detect_yield_spike("10year")
-        ys30       = detect_yield_spike("30year")
-        greeks     = fetch_option_greeks(symbol)
+        candles   = window.reset_index().to_dict("records")
+        breakout  = calculate_breakout_prob(candles)
+        rec_move  = calculate_recent_move_pct(candles)        # was two args, now one
+        tod       = calculate_time_of_day(current.name)
+        vol_ratio = calculate_volume_ratio(candles)           # was two args, now one
+        rsi       = compute_rsi(candles)
+        corr_dev  = compute_corr_deviation(symbol)
+        skew_ratio= compute_skew_ratio(symbol)
+
+        # safe yield spikes
+        ys2  = safe_detect_yield_spike("2year")
+        ys10 = safe_detect_yield_spike("10year")
+        ys30 = safe_detect_yield_spike("30year")
+
+        greeks = fetch_option_greeks(symbol)
 
         feat = {
-            "symbol":         symbol,
-            "breakout_prob":  breakout,
+            "symbol": symbol,
+            "breakout_prob": breakout,
             "recent_move_pct": rec_move,
-            "time_of_day":    tod,
-            "volume_ratio":   vol_ratio,
-            "rsi":            rsi,
-            "corr_dev":       corr_dev,
-            "skew_ratio":     skew_ratio,
+            "time_of_day": tod,
+            "volume_ratio": vol_ratio,
+            "rsi": rsi,
+            "corr_dev": corr_dev,
+            "skew_ratio": skew_ratio,
             "yield_spike_2year":  ys2,
             "yield_spike_10year": ys10,
             "yield_spike_30year": ys30,
@@ -106,14 +127,13 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
 def main():
     all_dfs = []
     for ticker in TICKERS:
-        print(f"Generating data for {ticker}…")
+        logger.info(f'"Generating data for {ticker}…"')
         all_dfs.append(extract_features_and_label(ticker))
 
     full = pd.concat(all_dfs, ignore_index=True)
-    # shuffle the rows to avoid any timezone or ticker ordering biases
     full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
     full.to_csv(OUTPUT_PATH, index=False)
-    print(f"✅ Saved {len(full)} rows to {OUTPUT_PATH}")
+    logger.info(f'"✅ Saved {len(full)} rows to {OUTPUT_PATH}"')
 
 if __name__ == "__main__":
     main()
