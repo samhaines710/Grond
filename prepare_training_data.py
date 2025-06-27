@@ -1,4 +1,10 @@
-# prepare_training_data.py
+#!/usr/bin/env python3
+"""
+prepare_training_data.py
+
+Fetches historical OHLC bars, computes feature vectors (including treasury yields
+from Polygon’s treasury-yields endpoint), and labels each window as CALL/PUT/NEUTRAL.
+"""
 
 import os
 import logging
@@ -33,18 +39,18 @@ YIELDS_ENDPOINT = "https://api.polygon.io/fed/v1/treasury-yields"
 def fetch_treasury_yields(date: str = None) -> dict:
     """
     Calls Polygon's treasury-yields endpoint once and returns a dict
-    mapping 'yield_2_year', 'yield_10_year', 'yield_30_year', etc.
+    mapping keys like 'yield_2_year', 'yield_10_year', 'yield_30_year', etc.
     """
     params = {"apiKey": POLYGON_API_KEY}
     if date:
         params["date"] = date
     resp = requests.get(YIELDS_ENDPOINT, params=params, timeout=10)
     resp.raise_for_status()
-    data = resp.json().get("results", [])
-    if not data:
+    results = resp.json().get("results", [])
+    if not results:
         logger.warning(f'"No yield data returned for date={date}"')
         return {}
-    record = data[0]
+    record = results[0]
     logger.info(f'"Fetched treasury yields for date={record.get("date")}"')
     return record
 
@@ -86,7 +92,7 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
     )
     df.set_index("dt", inplace=True)
 
-    # 3) Hoist yield and Greeks outside loop
+    # 3) Hoist yields & Greeks outside the loop
     ys2  = float(YIELDS.get("yield_2_year", 0.0))
     ys10 = float(YIELDS.get("yield_10_year", 0.0))
     ys30 = float(YIELDS.get("yield_30_year", 0.0))
@@ -101,24 +107,28 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
         candles = window.reset_index().to_dict("records")
 
         feat = {
-            "symbol":          symbol,
-            "breakout_prob":   calculate_breakout_prob(candles),
-            "recent_move_pct": calculate_recent_move_pct(candles),
-            "time_of_day":     calculate_time_of_day(current.name),
-            "volume_ratio":    calculate_volume_ratio(candles),
-            "rsi":             compute_rsi(candles),
-            "corr_dev":        compute_corr_deviation(symbol),
-            "skew_ratio":      compute_skew_ratio(symbol),
-            "yield_spike_2year":  ys2,
-            "yield_spike_10year": ys10,
-            "yield_spike_30year": ys30,
+            "symbol":            symbol,
+            "breakout_prob":     calculate_breakout_prob(candles),
+            "recent_move_pct":   calculate_recent_move_pct(candles),
+            "time_of_day":       calculate_time_of_day(current.name),
+            "volume_ratio":      calculate_volume_ratio(candles),
+            "rsi":               compute_rsi(candles),
+            "corr_dev":          compute_corr_deviation(symbol),
+            "skew_ratio":        compute_skew_ratio(symbol),
+            "yield_spike_2year": ys2,
+            "yield_spike_10year":ys10,
+            "yield_spike_30year":ys30,
             **greeks
         }
 
         # 5) Label next bar’s return
         next_bar = df.iloc[i + LOOKAHEAD_BARS]
         delta = (next_bar["close"] - current["close"]) / current["close"]
-        feat["movement_type"] = "CALL" if delta > 0 else ("PUT" if delta < 0 else "NEUTRAL")
+        feat["movement_type"] = (
+            "CALL" if delta > 0
+            else "PUT" if delta < 0
+            else "NEUTRAL"
+        )
 
         records.append(feat)
 
