@@ -33,25 +33,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Fetch Treasury Yields ─────────────────────────────────────────────────────
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-YIELDS_ENDPOINT = "https://api.polygon.io/fed/v1/treasury-yields"
+POLYGON_API_KEY  = os.getenv("POLYGON_API_KEY", "")
+YIELDS_ENDPOINT  = "https://api.polygon.io/fed/v1/treasury-yields"
 
 def fetch_treasury_yields(date: str = None) -> dict:
     """
-    Call Polygon's treasury-yields endpoint once and return a dict
-    mapping 'yield_2_year', 'yield_10_year', 'yield_30_year', etc.
+    Calls Polygon's treasury-yields endpoint once and returns a dict
+    mapping keys like 'yield_2_year', 'yield_10_year', 'yield_30_year', etc.
     """
     params = {"apiKey": POLYGON_API_KEY}
     if date:
         params["date"] = date
-
     resp = requests.get(YIELDS_ENDPOINT, params=params, timeout=10)
     resp.raise_for_status()
     results = resp.json().get("results", [])
     if not results:
         logger.warning(f'"No yield data returned for date={date}"')
         return {}
-
     record = results[0]
     logger.info(f'"Fetched treasury yields for date={record.get("date")}"')
     return record
@@ -60,10 +58,10 @@ def fetch_treasury_yields(date: str = None) -> dict:
 YIELDS = fetch_treasury_yields()
 
 # ─── Output Configuration ───────────────────────────────────────────────────────
-OUTPUT_DIR  = "data"
-OUTPUT_FILE = "movement_training_data.csv"
+OUTPUT_DIR   = "data"
+OUTPUT_FILE  = "movement_training_data.csv"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-OUTPUT_PATH = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
+OUTPUT_PATH  = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
 
 # ─── Parameters (allow CI override) ────────────────────────────────────────────
 HIST_DAYS      = int(os.getenv("HIST_DAYS", 30))
@@ -71,14 +69,14 @@ LOOKBACK_BARS  = 12
 LOOKAHEAD_BARS = 1
 
 def extract_features_and_label(symbol: str) -> pd.DataFrame:
-    # 1) Load OHLC bars
+    # 1) Fetch OHLC bars
     end   = datetime.now(tz)
     start = end - timedelta(days=HIST_DAYS)
     loader   = HistoricalDataLoader()
     raw_bars = loader.fetch_bars(symbol, start, end)
     logger.info(f'"Fetched {len(raw_bars)} bars for {symbol} over {HIST_DAYS} days"')
 
-    # 2) Frame into DataFrame with datetime index
+    # 2) Build DataFrame with datetime index
     df = pd.DataFrame([{
         "timestamp": b["t"],
         "open":      b["o"],
@@ -95,9 +93,9 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
     df.set_index("dt", inplace=True)
 
     # 3) Hoist yields & Greeks outside the loop
-    ys2   = float(YIELDS.get("yield_2_year", 0.0))
-    ys10  = float(YIELDS.get("yield_10_year", 0.0))
-    ys30  = float(YIELDS.get("yield_30_year", 0.0))
+    ys2  = float(YIELDS.get("yield_2_year", 0.0))
+    ys10 = float(YIELDS.get("yield_10_year", 0.0))
+    ys30 = float(YIELDS.get("yield_30_year", 0.0))
     greeks = fetch_option_greeks(symbol)
     logger.info(f'"Using yields (2y={ys2},10y={ys10},30y={ys30}) and Greeks for {symbol}"')
 
@@ -109,28 +107,23 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
         candles = window.reset_index().to_dict("records")
 
         feat = {
-            "symbol":             symbol,
-            "breakout_prob":      calculate_breakout_prob(candles),
-            "recent_move_pct":    calculate_recent_move_pct(candles),
-            "time_of_day":        calculate_time_of_day(current.name),
-            "volume_ratio":       calculate_volume_ratio(candles),
-            "rsi":                compute_rsi(candles),
-            "corr_dev":           compute_corr_deviation(symbol),
-            "skew_ratio":         compute_skew_ratio(symbol),
-            "yield_spike_2year":  ys2,
-            "yield_spike_10year": ys10,
-            "yield_spike_30year": ys30,
+            "breakout_prob":     calculate_breakout_prob(candles),
+            "recent_move_pct":   calculate_recent_move_pct(candles),
+            "time_of_day":       calculate_time_of_day(current.name),
+            "volume_ratio":      calculate_volume_ratio(candles),
+            "rsi":               compute_rsi(candles),
+            "corr_dev":          compute_corr_deviation(symbol),
+            "skew_ratio":        compute_skew_ratio(symbol),
+            "yield_spike_2year": ys2,
+            "yield_spike_10year":ys10,
+            "yield_spike_30year":ys30,
             **greeks
         }
 
-        # 5) Label: next bar’s return
+        # 5) Label next bar’s return
         next_bar = df.iloc[i + LOOKAHEAD_BARS]
         delta = (next_bar["close"] - current["close"]) / current["close"]
-        feat["movement_type"] = (
-            "CALL" if delta > 0
-            else "PUT" if delta < 0
-            else "NEUTRAL"
-        )
+        feat["movement_type"] = "CALL" if delta > 0 else ("PUT" if delta < 0 else "NEUTRAL")
 
         records.append(feat)
 
@@ -140,8 +133,7 @@ def main():
     all_dfs = []
     for ticker in TICKERS:
         logger.info(f'"Generating data for {ticker}"')
-        df_ticker = extract_features_and_label(ticker)
-        all_dfs.append(df_ticker)
+        all_dfs.append(extract_features_and_label(ticker))
 
     full = pd.concat(all_dfs, ignore_index=True)
     full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
