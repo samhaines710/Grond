@@ -37,7 +37,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 YIELDS_ENDPOINT = "https://api.polygon.io/fed/v1/treasury-yields"
 
 def fetch_treasury_yields() -> dict:
-    """One-and-done call to the new treasury-yields endpoint."""
+    """One call to Polygon’s treasury-yields endpoint."""
     resp = requests.get(YIELDS_ENDPOINT, params={"apiKey": POLYGON_API_KEY}, timeout=10)
     resp.raise_for_status()
     results = resp.json().get("results", [])
@@ -88,7 +88,7 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
     )
     df.set_index("dt", inplace=True)
 
-    # 3) Pre-compute Greeks once
+    # 3) Pre-compute Greeks
     greeks = fetch_option_greeks(symbol)
     logger.info(f'"Using yields (2y={ys2},10y={ys10},30y={ys30}) + Greeks for {symbol}"')
 
@@ -115,8 +115,8 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
         }
 
         # 5) Label next bar’s return
-        nb    = df.iloc[i + LOOKAHEAD_BARS]
-        delta = (nb["close"] - current["close"]) / current["close"]
+        next_bar = df.iloc[i + LOOKAHEAD_BARS]
+        delta    = (next_bar["close"] - current["close"]) / current["close"]
         feat["movement_type"] = "CALL" if delta > 0 else ("PUT" if delta < 0 else "NEUTRAL")
 
         records.append(feat)
