@@ -1,136 +1,110 @@
 #!/usr/bin/env python3
+"""
+prepare_training_data.py
+
+Fetches historical OHLC bars, computes feature vectors (including treasury yields
+from Polygon’s treasury-yields endpoint), and labels each window as CALL/PUT/NEUTRAL.
+"""
+
 import os
-import argparse
-import logging
-
 import pandas as pd
-import joblib
-import xgboost as xgb
+from datetime import datetime, timedelta
 
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.metrics import accuracy_score
-
-# ─── Logging Setup ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","module":"%(module)s","message":"%(message)s"}'
+from config import TICKERS, tz
+from data_ingestion import HistoricalDataLoader
+from utils import (
+    reformat_candles,
+    calculate_breakout_prob,
+    calculate_recent_move_pct,
+    calculate_time_of_day,
+    calculate_volume_ratio,
+    compute_rsi,
+    compute_corr_deviation,
+    compute_skew_ratio,
+    detect_yield_spike,
+    fetch_option_greeks
 )
-logger = logging.getLogger(__name__)
 
-# ─── Defaults ──────────────────────────────────────────────────────────────────
-DEFAULT_TRAIN_CSV   = "data/movement_training_data.csv"
-DEFAULT_MODEL_DIR   = "models"
-DEFAULT_MODEL_FILE  = "xgb_classifier.pipeline.joblib"
+# ─── Output Configuration ───────────────────────────────────────────────────────
+OUTPUT_DIR  = "data"
+OUTPUT_FILE = "movement_training_data.csv"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+OUTPUT_PATH = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
 
-# ─── Arg Parsing ───────────────────────────────────────────────────────────────
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Train XGB classifier on your movement data"
+# ─── Parameters ────────────────────────────────────────────────────────────────
+HIST_DAYS      = 30
+LOOKBACK_BARS  = 12
+LOOKAHEAD_BARS = 1
+
+def extract_features_and_label(symbol: str) -> pd.DataFrame:
+    # 1) Fetch OHLC bars
+    end   = datetime.now(tz)
+    start = end - timedelta(days=HIST_DAYS)
+    loader   = HistoricalDataLoader()
+    raw_bars = loader.fetch_bars(symbol, start, end)
+
+    # 2) Build DataFrame
+    df = pd.DataFrame([{
+        "timestamp": b["t"],
+        "open":      b["o"],
+        "high":      b["h"],
+        "low":       b["l"],
+        "close":     b["c"],
+        "volume":    b["v"]
+    } for b in raw_bars])
+    df["dt"] = (
+        pd.to_datetime(df["timestamp"], unit="ms")
+          .dt.tz_localize("UTC")
+          .dt.tz_convert(tz)
     )
-    p.add_argument(
-        "--train-csv", type=str, default=DEFAULT_TRAIN_CSV,
-        help="path to your CSV with features + movement_type"
-    )
-    p.add_argument(
-        "--label-col", type=str, required=True,
-        help="the name of your target column (e.g. movement_type)"
-    )
-    p.add_argument(
-        "--model-dir", type=str, default=DEFAULT_MODEL_DIR,
-        help="directory to save the trained pipeline"
-    )
-    p.add_argument(
-        "--model-filename", type=str, default=DEFAULT_MODEL_FILE,
-        help="filename (inside model-dir) for the pipeline"
-    )
-    return p.parse_args()
+    df.set_index("dt", inplace=True)
 
-# ─── Training Function ─────────────────────────────────────────────────────────
-def train(train_csv: str, label_col: str, model_dir: str, model_filename: str):
-    # 1) Load data
-    logger.info(f"Loading training data from {train_csv}")
-    df = pd.read_csv(train_csv)
-    if label_col not in df.columns:
-        raise ValueError(f"Label column {label_col!r} not found in {train_csv}")
+    records = []
+    # 3) Slide window to compute features + label
+    for i in range(LOOKBACK_BARS, len(df) - LOOKAHEAD_BARS):
+        window  = df.iloc[i-LOOKBACK_BARS : i]
+        current = df.iloc[i]
+        candles = window.reset_index().to_dict("records")
 
-    X = df.drop(columns=[label_col])
-    y = df[label_col]
+        # feature computations
+        feat = {
+            "symbol":            symbol,
+            "breakout_prob":     calculate_breakout_prob(candles),
+            "recent_move_pct":   calculate_recent_move_pct(candles),
+            "time_of_day":       calculate_time_of_day(current.name),
+            "volume_ratio":      calculate_volume_ratio(candles),
+            "rsi":               compute_rsi(candles),
+            "corr_dev":          compute_corr_deviation(symbol),
+            "skew_ratio":        compute_skew_ratio(symbol),
+            "yield_spike_2year": detect_yield_spike("2year"),
+            "yield_spike_10year":detect_yield_spike("10year"),
+            "yield_spike_30year":detect_yield_spike("30year"),
+            **fetch_option_greeks(symbol)
+        }
 
-    # 2) Split
-    logger.info("Splitting data: test_size=0.2, random_state=42")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, stratify=y, test_size=0.2, random_state=42
-    )
-
-    # 3) Identify numeric vs categorical
-    num_cols = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
-    # explicitly list any string/categorical columns here:
-    cat_cols = ["time_of_day"]
-
-    logger.info(f"Numeric columns: {num_cols}")
-    logger.info(f"Categorical columns: {cat_cols}")
-
-    # 4) Build ColumnTransformer
-    preprocessor = ColumnTransformer(transformers=[
-        (
-            "num",
-            StandardScaler(),
-            num_cols
-        ),
-        (
-            "cat",
-            OneHotEncoder(handle_unknown="ignore", sparse=False),
-            cat_cols
+        # label next bar’s return
+        next_bar = df.iloc[i + LOOKAHEAD_BARS]
+        move_pct = (next_bar["close"] - current["close"]) / current["close"]
+        feat["movement_type"] = (
+            "CALL" if move_pct > 0
+            else "PUT" if move_pct < 0
+            else "NEUTRAL"
         )
-    ])
 
-    # 5) Full pipeline: preprocess → XGB
-    pipeline = Pipeline(steps=[
-        ("pre", preprocessor),
-        ("xgb", xgb.XGBClassifier(
-            use_label_encoder=False,
-            objective="multi:softprob",
-            eval_metric="mlogloss",
-            random_state=42
-        ))
-    ])
+        records.append(feat)
 
-    # 6) Train
-    logger.info("Fitting pipeline on training data")
-    pipeline.fit(X_train, y_train)
+    return pd.DataFrame(records)
 
-    # 7) Evaluate
-    logger.info("Predicting on test set")
-    preds = pipeline.predict(X_test)
-    acc   = accuracy_score(y_test, preds)
-    logger.info(f"Validation Accuracy: {acc:.4f}")
+def main():
+    all_dfs = []
+    for ticker in TICKERS:
+        print(f"Generating data for {ticker}…")
+        all_dfs.append(extract_features_and_label(ticker))
 
-    # 8) Save feature names (for downstream inference)
-    cat_feature_names = (
-        pipeline
-        .named_steps["pre"]
-        .named_transformers_["cat"]
-        .get_feature_names_out(cat_cols)
-        .tolist()
-    )
-    feature_names = num_cols + cat_feature_names
-    pipeline.feature_names = feature_names
+    full = pd.concat(all_dfs, ignore_index=True)
+    full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
+    full.to_csv(OUTPUT_PATH, index=False)
+    print(f"✅ Saved {len(full)} rows to {OUTPUT_PATH}")
 
-    # 9) Persist pipeline
-    os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, model_filename)
-    joblib.dump(pipeline, model_path)
-    logger.info(f"✅ Trained pipeline saved to {model_path}")
-
-# ─── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    args = parse_args()
-    train(
-        train_csv      = args.train_csv,
-        label_col      = args.label_col,
-        model_dir      = args.model_dir,
-        model_filename = args.model_filename
-    )
+    main()
