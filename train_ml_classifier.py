@@ -2,8 +2,8 @@
 """
 train_ml_classifier.py
 
-Trains XGBClassifier on the movement data. Drops any string columns (like "symbol")
-so you won’t get string-to-float errors.
+Trains XGBClassifier on the movement data. Drops string columns so you
+won’t hit “could not convert string to float” errors.
 """
 
 import os
@@ -28,25 +28,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Train and persist the XGBClassifier pipeline."
-    )
-    p.add_argument(
-        "--train-csv",
-        default=os.getenv("TRAIN_DATA_PATH", "data/movement_training_data.csv")
-    )
-    p.add_argument(
-        "--label-col",
-        default=os.getenv("LABEL_COL", "movement_type")
-    )
-    p.add_argument(
-        "--model-dir",
-        default=os.getenv("MODEL_DIR", "models")
-    )
-    p.add_argument(
-        "--model-filename",
-        default=os.getenv("MODEL_FILENAME", "xgb_classifier.pipeline.joblib")
-    )
+    p = argparse.ArgumentParser(description="Train XGB classifier on movement data")
+    p.add_argument("--train-csv",      default="data/movement_training_data.csv")
+    p.add_argument("--label-col",      default="movement_type")
+    p.add_argument("--model-dir",      default="models")
+    p.add_argument("--model-filename", default="xgb_classifier.pipeline.joblib")
     return p.parse_args()
 
 def train(train_csv, label_col, model_dir, model_filename):
@@ -54,11 +40,12 @@ def train(train_csv, label_col, model_dir, model_filename):
     df = pd.read_csv(train_csv)
 
     if label_col not in df.columns:
-        raise ValueError(f"Label column {label_col!r} not found")
+        raise ValueError(f"Missing label column: {label_col!r}")
 
-    # Drop all object/string columns (including “symbol”)
-    drop_cols = [label_col] + df.select_dtypes(include=["object"]).columns.drop(label_col).tolist()
-    X = df.drop(columns=drop_cols)
+    # Drop all object (string) columns except the label itself
+    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    drop_cols = [c for c in obj_cols if c != label_col]
+    X = df.drop(columns=drop_cols + [label_col])
     y = df[label_col]
 
     logger.info('"Splitting data (test_size=0.2, random_state=42)"')
@@ -66,19 +53,22 @@ def train(train_csv, label_col, model_dir, model_filename):
         X, y, stratify=y, test_size=0.2, random_state=42
     )
 
-    # Build preprocessing & model pipeline
+    # Build preprocessing + model pipeline
     num_cols = X_train.select_dtypes(include=["int64","float64"]).columns.tolist()
-    cat_cols = []  # no categorical for now
+    cat_cols = []  # no categorical needed now
 
     logger.info(f'"Num cols={num_cols}, Cat cols={cat_cols}"')
-
-    pre = ColumnTransformer([
+    preprocessor = ColumnTransformer([
         ("num", StandardScaler(), num_cols),
-        ("cat", OneHotEncoder(handle_unknown="ignore", sparse=False), cat_cols),
+        (
+            "cat",
+            OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+            cat_cols
+        ),
     ], remainder="drop")
 
     pipeline = Pipeline([
-        ("pre", pre),
+        ("pre", preprocessor),
         ("xgb", xgb.XGBClassifier(
             use_label_encoder=False,
             objective="multi:softprob",
@@ -87,7 +77,7 @@ def train(train_csv, label_col, model_dir, model_filename):
         ))
     ])
 
-    logger.info('"Fitting pipeline…"')
+    logger.info('"Fitting pipeline on training data"')
     pipeline.fit(X_train, y_train)
 
     logger.info('"Validating…"')
@@ -95,7 +85,7 @@ def train(train_csv, label_col, model_dir, model_filename):
     acc   = accuracy_score(y_test, preds)
     logger.info(f'"Validation Accuracy: {acc:.4f}"')
 
-    # Save feature names
+    # Save output feature names
     feature_names = (
         num_cols +
         pipeline.named_steps["pre"]
@@ -105,11 +95,11 @@ def train(train_csv, label_col, model_dir, model_filename):
     )
     pipeline.feature_names = feature_names
 
-    # Persist
+    # Persist pipeline
     os.makedirs(model_dir, exist_ok=True)
-    path = os.path.join(model_dir, model_filename)
-    joblib.dump(pipeline, path)
-    logger.info(f'"✅ Saved pipeline to {path}"')
+    out_path = os.path.join(model_dir, model_filename)
+    joblib.dump(pipeline, out_path)
+    logger.info(f'"✅ Saved pipeline to {out_path}"')
 
 if __name__ == "__main__":
     args = parse_args()
