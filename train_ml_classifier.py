@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+train_ml_classifier.py
+
+Loads your CSV, drops any non-numeric columns (including 'symbol'),
+encodes string labels to integers, trains an XGBClassifier pipeline,
+validates on a hold-out set, and dumps the pipeline (with feature
+names + label encoder attached) into models/xgb_classifier.pipeline.joblib.
+"""
+
 import os
 import argparse
 import logging
@@ -6,10 +15,9 @@ import logging
 import pandas as pd
 import joblib
 import xgboost as xgb
-
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score
 
 def setup_logging():
@@ -37,16 +45,19 @@ def train(
     if label_col not in df.columns:
         raise ValueError(f"Label column '{label_col}' not found in {train_csv}")
 
-    # Separate out X and y
-    X = df.drop(columns=[label_col])
-    y = df[label_col]
+    # Drop any stray non-feature columns
+    df = df.drop(columns=["symbol"], errors="ignore")
 
-    # Encode string labels to 0,1,2...
+    # Separate X and y
+    y = df.pop(label_col)
+    X = df
+
+    # Encode string labels to integers
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
     logger.info(f"Classes mapped: {list(le.classes_)} -> {list(range(len(le.classes_)))}")
 
-    # Split
+    # Train/test split
     logger.info(f"Splitting data: test_size={test_size}, random_state={random_state}")
     X_train, X_test, y_train, y_test = train_test_split(
         X, y_enc, stratify=y_enc, test_size=test_size, random_state=random_state
@@ -68,28 +79,28 @@ def train(
     logger.info("Fitting pipeline on training data")
     pipeline.fit(X_train, y_train)
 
-    # Validate
+    # Evaluate
     logger.info("Evaluating on test set")
     preds_enc = pipeline.predict(X_test)
     preds = le.inverse_transform(preds_enc)
-    y_test_labels = le.inverse_transform(y_test)
-    acc = accuracy_score(y_test_labels, preds)
+    truth = le.inverse_transform(y_test)
+    acc = accuracy_score(truth, preds)
     logger.info(f"Validation Accuracy: {acc:.4f}")
 
-    # Attach metadata to pipeline for inference
+    # Attach metadata for downstream inference
     pipeline.feature_names = X.columns.tolist()
     pipeline.label_encoder = le
-    logger.info(f"Attached {len(pipeline.feature_names)} feature names and label encoder to pipeline")
+    logger.info(f"Attached {len(pipeline.feature_names)} feature names and label encoder")
 
     # Persist
     os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, model_filename)
-    joblib.dump(pipeline, model_path)
-    logger.info(f"✅ Trained pipeline saved to {model_path}")
+    out_path = os.path.join(model_dir, model_filename)
+    joblib.dump(pipeline, out_path)
+    logger.info(f"✅ Trained pipeline saved to {out_path}")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train and persist the XGBClassifier movement‐type pipeline."
+        description="Train and persist the XGBClassifier movement-type pipeline."
     )
     parser.add_argument(
         "--train-csv",
@@ -129,10 +140,10 @@ if __name__ == "__main__":
     setup_logging()
     args = parse_args()
     train(
-        train_csv=args.train_csv,
-        label_col=args.label_col,
-        model_dir=args.model_dir,
-        model_filename=args.model_filename,
-        test_size=args.test_size,
-        random_state=args.random_state
+        train_csv      = args.train_csv,
+        label_col      = args.label_col,
+        model_dir      = args.model_dir,
+        model_filename = args.model_filename,
+        test_size      = args.test_size,
+        random_state   = args.random_state
     )
