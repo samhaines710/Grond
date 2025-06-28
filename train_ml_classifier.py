@@ -2,10 +2,9 @@
 """
 train_ml_classifier.py
 
-Loads your CSV, drops any non-numeric columns (including 'symbol'),
-encodes string labels to integers, trains an XGBClassifier pipeline,
-validates on a hold-out set, and dumps the pipeline (with feature
-names + label encoder attached) into models/xgb_classifier.pipeline.joblib.
+Reads data/movement_training_data.csv, preprocesses numeric + categorical,
+label-encodes the target, fits an XGBClassifier pipeline, evaluates, and
+saves the pipeline (with feature_names + label_encoder attached).
 """
 
 import os
@@ -15,20 +14,22 @@ import logging
 import pandas as pd
 import joblib
 import xgboost as xgb
+
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
 from sklearn.metrics import accuracy_score
 
 def setup_logging():
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter(
         '{"timestamp":"%(asctime)s","level":"%(levelname)s","module":"%(module)s","message":%(message)s}'
     ))
     root.handlers.clear()
-    root.addHandler(handler)
+    root.addHandler(h)
 
 def train(
     train_csv: str,
@@ -45,28 +46,38 @@ def train(
     if label_col not in df.columns:
         raise ValueError(f"Label column '{label_col}' not found in {train_csv}")
 
-    # Drop any stray non-feature columns
-    df = df.drop(columns=["symbol"], errors="ignore")
+    # drop symbol if present
+    if "symbol" in df.columns:
+        df = df.drop(columns=["symbol"])
 
-    # Separate X and y
-    y = df.pop(label_col)
-    X = df
+    X = df.drop(columns=[label_col])
+    y = df[label_col]
 
-    # Encode string labels to integers
-    le = LabelEncoder()
+    # encode target
+    le    = LabelEncoder()
     y_enc = le.fit_transform(y)
     logger.info(f"Classes mapped: {list(le.classes_)} -> {list(range(len(le.classes_)))}")
 
-    # Train/test split
+    # split
     logger.info(f"Splitting data: test_size={test_size}, random_state={random_state}")
     X_train, X_test, y_train, y_test = train_test_split(
         X, y_enc, stratify=y_enc, test_size=test_size, random_state=random_state
     )
 
-    # Build pipeline
-    logger.info("Building pipeline (StandardScaler + XGBClassifier)")
+    # identify numeric vs categorical
+    num_cols = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
+    logger.info(f"Numeric cols: {num_cols}")
+    logger.info(f"Categorical cols: {cat_cols}")
+
+    # build preprocessor
+    preprocessor = ColumnTransformer([
+        ("num", StandardScaler(), num_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)
+    ])
+
     pipeline = Pipeline([
-        ("scaler", StandardScaler()),
+        ("pre", preprocessor),
         ("xgb", xgb.XGBClassifier(
             use_label_encoder=False,
             objective="multi:softprob",
@@ -75,66 +86,40 @@ def train(
         ))
     ])
 
-    # Fit
     logger.info("Fitting pipeline on training data")
     pipeline.fit(X_train, y_train)
 
-    # Evaluate
-    logger.info("Evaluating on test set")
+    # evaluate
     preds_enc = pipeline.predict(X_test)
-    preds = le.inverse_transform(preds_enc)
-    truth = le.inverse_transform(y_test)
-    acc = accuracy_score(truth, preds)
+    preds     = le.inverse_transform(preds_enc)
+    y_true    = le.inverse_transform(y_test)
+    acc = accuracy_score(y_true, preds)
     logger.info(f"Validation Accuracy: {acc:.4f}")
 
-    # Attach metadata for downstream inference
-    pipeline.feature_names = X.columns.tolist()
+    # attach metadata
+    feature_names = num_cols + \
+      list(pipeline.named_steps["pre"]
+                   .named_transformers_["cat"]
+                   .get_feature_names_out(cat_cols))
+    pipeline.feature_names = feature_names
     pipeline.label_encoder = le
-    logger.info(f"Attached {len(pipeline.feature_names)} feature names and label encoder")
+    logger.info(f"Attached {len(feature_names)} feature names + label encoder")
 
-    # Persist
+    # save
     os.makedirs(model_dir, exist_ok=True)
-    out_path = os.path.join(model_dir, model_filename)
-    joblib.dump(pipeline, out_path)
-    logger.info(f"✅ Trained pipeline saved to {out_path}")
+    path = os.path.join(model_dir, model_filename)
+    joblib.dump(pipeline, path)
+    logger.info(f"✅ Trained pipeline saved to {path}")
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train and persist the XGBClassifier movement-type pipeline."
-    )
-    parser.add_argument(
-        "--train-csv",
-        default=os.getenv("TRAIN_DATA_PATH", "data/movement_training_data.csv"),
-        help="Path to labeled training CSV (must include '<label_col>' column)."
-    )
-    parser.add_argument(
-        "--label-col",
-        default=os.getenv("LABEL_COL", "movement_type"),
-        help="Name of the target column in the CSV."
-    )
-    parser.add_argument(
-        "--model-dir",
-        default=os.getenv("MODEL_DIR", "models"),
-        help="Directory to write the trained pipeline."
-    )
-    parser.add_argument(
-        "--model-filename",
-        default=os.getenv("MODEL_FILENAME", "xgb_classifier.pipeline.joblib"),
-        help="Filename for the saved pipeline."
-    )
-    parser.add_argument(
-        "--test-size",
-        type=float,
-        default=float(os.getenv("TEST_SIZE", "0.2")),
-        help="Fraction of data to hold out for validation."
-    )
-    parser.add_argument(
-        "--random-state",
-        type=int,
-        default=int(os.getenv("RANDOM_STATE", "42")),
-        help="Random seed for reproducibility."
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--train-csv",      default="data/movement_training_data.csv")
+    p.add_argument("--label-col",      default="movement_type")
+    p.add_argument("--model-dir",      default="models")
+    p.add_argument("--model-filename", default="xgb_classifier.pipeline.joblib")
+    p.add_argument("--test-size",      type=float, default=0.2)
+    p.add_argument("--random-state",   type=int,   default=42)
+    return p.parse_args()
 
 if __name__ == "__main__":
     setup_logging()
