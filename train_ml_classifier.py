@@ -4,7 +4,7 @@ train_ml_classifier.py
 
 Reads data/movement_training_data.csv, preprocesses numeric + categorical,
 label-encodes the target, fits an XGBClassifier pipeline, evaluates, and
-saves the pipeline (with feature_names + label_encoder attached).
+saves the pipeline (with feature_names + label_encoder attached)
 """
 
 import os
