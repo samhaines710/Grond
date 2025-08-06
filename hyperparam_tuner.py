@@ -5,7 +5,7 @@ trials across a defined parameter space using AdaptiveHyperparamOptimizer,
 and writes the best-performing configuration back to disk.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import json
 import os
