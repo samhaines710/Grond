@@ -5,7 +5,7 @@ and provides methods to compute optimal weight allocations under different
 objectives.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 from typing import Tuple
 
