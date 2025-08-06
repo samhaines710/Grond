@@ -5,7 +5,7 @@ volume impact, and volatility impact, plus a ManualExecutor class that logs
 and notifies a manual trade.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import logging
 from datetime import datetime
