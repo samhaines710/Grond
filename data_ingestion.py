@@ -69,7 +69,11 @@ class HistoricalDataLoader:
                 day0 = start.date().strftime("%Y-%m-%d")
                 day1 = end.date().strftime("%Y-%m-%d")
                 path = f"/v2/aggs/ticker/{ticker}/range/5/minute/{day0}/{day1}"
-                params: Dict[str, Any] = {"adjusted": "true", "sort": "asc", "limit": limit}
+                params: Dict[str, Any] = {
+                    "adjusted": "true",
+                    "sort": "asc",
+                    "limit": limit,
+                }
                 data = self._get(path, params)
 
             bars = data.get("results", [])
