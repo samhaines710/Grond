@@ -6,7 +6,7 @@ computes a sliding window of features and labels, and writes the result to
 `data/movement_training_data.csv`.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import os
 import logging
