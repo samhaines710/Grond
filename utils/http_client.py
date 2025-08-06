@@ -6,7 +6,7 @@ functions to fetch option Greeks via the Polygon snapshot API,
 falling back to local calculations when necessary.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import math
 import threading
