@@ -22,7 +22,7 @@ pytest
 flake8
 python-dotenv
 optuna
-gym
+gymnasium 
 stable-baselines3>=2.0.0
 xgboost==2.0.3
 uvicorn
