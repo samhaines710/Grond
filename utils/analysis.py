@@ -7,7 +7,7 @@ Polygon API and compute derived metrics like skew ratio, correlation
 deviation, RSI, and yield spikes.
 """
 
-from __future__ import annotations
+from __future__ annotations
 
 import json
 import math
@@ -19,7 +19,10 @@ from config import LOOKBACK_BREAKOUT, LOOKBACK_RISK_REWARD, tz
 from utils.http_client import safe_fetch_polygon_data
 
 
-def calculate_breakout_prob(candles: List[dict], lookback: int = LOOKBACK_BREAKOUT) -> float:
+def calculate_breakout_prob(
+    candles: List[dict],
+    lookback: int = LOOKBACK_BREAKOUT,
+) -> float:
     """
     Estimate the probability of a breakout given a list of candles.
 
@@ -74,7 +77,8 @@ def calculate_signal_persistence(
     lookback: int = LOOKBACK_BREAKOUT,
 ) -> float:
     """
-    Estimate how persistent a signal is by comparing the last bar's move to average moves.
+    Estimate how persistent a signal is by comparing
+    the last bar's move to average moves.
     """
     if len(candles) < lookback:
         return 0.0
@@ -98,9 +102,9 @@ def calculate_reversal_and_scope(
     """
     Determine if there is a reversal and whether the magnitude (scope) is significant.
 
-    Returns a tuple of ``(is_reversal, is_scope, move_pct*100)`` where ``is_reversal``
-    indicates whether the price move conflicts with the open interest bias and ``is_scope``
-    flags whether the absolute move is above a small threshold.
+    Returns a tuple ``(is_reversal, is_scope, move_pct*100)`` where ``is_reversal``
+    indicates whether the price move conflicts with the open interest bias and
+    ``is_scope`` flags whether the absolute move is above a small threshold.
     """
     if len(candles) < 2:
         return False, False, 0.0
@@ -161,10 +165,12 @@ def compute_skew_ratio(ticker: str) -> float:
     Compute the skew ratio of implied volatilities between call and put options.
     """
     try:
-        data = safe_fetch_polygon_data(
-            f"https://api.polygon.io/v3/snapshot/options/{ticker}?apiKey={os.getenv('POLYGON_API_KEY')}",
-            ticker,
-        ).get("results", [])
+        # Build the snapshot URL in parts to avoid line-length issues
+        url = (
+            f"https://api.polygon.io/v3/snapshot/options/{ticker}"
+            f"?apiKey={os.getenv('POLYGON_API_KEY')}"
+        )
+        data = safe_fetch_polygon_data(url, ticker).get("results", [])
         calls = [
             o["implied_volatility"]
             for o in data
