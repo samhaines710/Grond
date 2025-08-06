@@ -7,7 +7,7 @@ Polygon API and compute derived metrics like skew ratio, correlation
 deviation, RSI, and yield spikes.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import json
 import math
