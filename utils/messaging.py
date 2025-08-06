@@ -70,7 +70,7 @@ def on_error(ws, err):
 def on_close(ws, code, msg):
     write_status(f"WebSocket closed: {code} - {msg}")
 
-def start_websocket_stream(url: str = "wss://delayed.polygon.io/stocks"):
+def start_websocket_stream(url: str = "wss://socket.polygon.io/stocks"):
     """
     Start a background thread for the Polygon WebSocket stream.
     """
