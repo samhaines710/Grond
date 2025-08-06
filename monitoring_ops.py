@@ -5,7 +5,7 @@ histograms, and gauges. It also starts a metrics server and a Flask app
 that provides `/metrics` and `/health` endpoints.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import errno
 import logging
