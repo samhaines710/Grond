@@ -6,7 +6,7 @@ implemented to prevent spamming, and errors are logged via
 ``write_status``.
 """
 
-from __future__ import annotations
+from __future__ annotations
 
 import asyncio
 import json
