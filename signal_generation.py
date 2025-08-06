@@ -3,8 +3,8 @@ import optuna
 from collections import defaultdict
 from typing import Callable, Dict, Any, List
 
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 from stable_baselines3 import PPO
 
 from ml_classifier import MLClassifier
