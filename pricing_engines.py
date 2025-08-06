@@ -5,7 +5,7 @@ solution, one using a JAX‑jitted function, and a pure‑Python fallback.
 A dispatcher class chooses the appropriate engine based on availability.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import math
 from enum import Enum
