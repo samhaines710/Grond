@@ -9,7 +9,7 @@ polygon-api-client
 websocket-client==1.6.0
 prometheus_client
 pandas_market_calendars
-scikit-learn
+scikit-learn==1.7.1
 cvxpy
 PyPortfolioOpt
 riskfolio-lib
@@ -24,8 +24,8 @@ python-dotenv
 optuna
 gym
 stable-baselines3>=2.0.0
-xgboost
+xgboost==2.0.3
 uvicorn
 fastapi
-joblib
+joblib==1.3.2
 boto3
