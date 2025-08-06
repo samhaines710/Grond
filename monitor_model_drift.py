@@ -6,7 +6,7 @@ calculates the PSI for each feature, logs detailed results, and alerts if
 the overall PSI exceeds a specified threshold.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import argparse
 import logging
