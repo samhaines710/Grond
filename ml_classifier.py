@@ -5,7 +5,7 @@ It provides a `classify` method to return a movement type and expected move
 percentage.
 """
 
-from __future__ annotations
+from __future__ import annotations
 
 import logging
 import os
