@@ -1,9 +1,11 @@
-"""Messaging and WebSocket helpers for notifications and live data.
+# messaging.py
 
-This module handles Telegram notifications and establishes a WebSocket
-connection to Polygon for live data subscriptions. Cooldown logic is
-implemented to prevent spamming, and errors are logged via
-``write_status``.
+"""
+Messaging and WebSocket helpers for notifications and live data.
+
+This module handles Telegram notifications with cooldown logic and
+establishes a WebSocket connection to Polygon for live data subscriptions.
+Errors and status updates are logged via write_status().
 """
 
 from __future__ import annotations
@@ -18,99 +20,81 @@ from typing import Optional
 import websocket
 from telegram import Bot, error as tg_error
 
-from config import TICKERS
+from config import TICKERS, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ENABLE_TELEGRAM, POLYGON_API_KEY, TELEGRAM_COOLDOWN_SECONDS
 from utils.logging_utils import write_status
 
-
-# Load environment variables
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "False").lower() in ("1", "true", "yes")
-
-
-# Instantiate Telegram bot if enabled and credentials are provided
-bot: Optional[Bot] = None
+# ─── Telegram setup ────────────────────────────────────────────────────────────
+_bot: Optional[Bot] = None
 if ENABLE_TELEGRAM and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    _bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-TELEGRAM_COOLDOWN_SECONDS = int(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "60"))
 _last_telegram_ts = 0.0
-
 
 def send_telegram(message: str) -> None:
     """
-    Send a message via Telegram respecting a cooldown period.
-
-    If the cooldown has not expired or the bot is not configured, the message
-    will not be sent. Errors are caught and logged.
+    Send a Markdown-formatted message via Telegram, respecting cooldown.
     """
     global _last_telegram_ts
     now = time.time()
     if now - _last_telegram_ts < TELEGRAM_COOLDOWN_SECONDS:
-        write_status("Skipping Telegram: cooldown active")
+        write_status("Skipping Telegram send: cooldown active")
         return
     _last_telegram_ts = now
 
-    if not bot:
+    if not _bot:
+        write_status("Telegram not configured; message dropped")
         return
 
     try:
+        # Telegram Bot API is async under the hood, so run in event loop
         loop = asyncio.get_event_loop()
         if loop.is_closed():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         loop.run_until_complete(
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+            _bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=message,
+                parse_mode="Markdown"
+            )
         )
     except tg_error.TimedOut:
-        write_status("Telegram timed out—skipping")
+        write_status("Telegram timed out; message skipped")
     except tg_error.TelegramError as exc:
-        if "flood control" not in str(exc).lower():
+        msg = str(exc).lower()
+        if "flood control" in msg:
+            write_status("Telegram flood control triggered; cooling down")
+        else:
             write_status(f"Telegram error: {exc}")
 
-
-# WebSocket instance and lock
+# ─── WebSocket setup ──────────────────────────────────────────────────────────
 _websocket_instance: Optional[websocket.WebSocketApp] = None
 _websocket_lock = threading.Lock()
 
-
 def on_message(ws: websocket.WebSocketApp, message: str) -> None:
-    """
-    Handler for incoming WebSocket messages.
-    """
+    """Handler for incoming WebSocket messages."""
     write_status(f"WS message received: {message[:200]}")
 
-
 def on_open(ws: websocket.WebSocketApp) -> None:
-    """
-    Authenticate and subscribe to symbols when the WebSocket opens.
-    """
-    write_status("WebSocket opened, authenticating...")
+    """Authenticate and subscribe when the WebSocket opens."""
+    write_status("WebSocket opened; authenticating…")
     ws.send(json.dumps({"action": "auth", "params": POLYGON_API_KEY}))
     for ticker in TICKERS:
         ws.send(json.dumps({"action": "subscribe", "params": f"AM.{ticker}"}))
-
 
 def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
     """Log WebSocket errors."""
     write_status(f"WebSocket error: {err}")
 
-
 def on_close(ws: websocket.WebSocketApp, code: int, msg: str) -> None:
-    """Log WebSocket closure events."""
+    """Log WebSocket closure and allow reconnect logic to handle restarts."""
     write_status(f"WebSocket closed: {code} - {msg}")
-
 
 def start_websocket_stream(url: str = "wss://socket.polygon.io/stocks") -> None:
     """
     Start a background thread for the Polygon WebSocket stream.
-
-    The default URL uses the real‑time feed; do not specify
-    ``delayed.polygon.io`` here. On errors, the connection will attempt
-    to reconnect after a short delay.
+    On crash, it will reconnect after a short delay.
     """
-
     def _run() -> None:
         while True:
             try:
@@ -126,7 +110,7 @@ def start_websocket_stream(url: str = "wss://socket.polygon.io/stocks") -> None:
                     _websocket_instance = ws
                 ws.run_forever()
             except Exception as exc:
-                write_status(f"WebSocket crashed: {exc}; reconnecting in 5s")
+                write_status(f"WebSocket crashed: {exc}; retrying in 5s")
                 time.sleep(5)
 
     thread = threading.Thread(target=_run, daemon=True)
