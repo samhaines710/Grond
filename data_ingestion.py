@@ -28,7 +28,7 @@ from config import POLYGON_API_KEY, TICKERS, tz
 from utils.http_client import safe_fetch_polygon_data, rate_limited
 from utils.logging_utils import write_status
 
-# In-memory stores for real-time candles: symbol -> deque of bars
+# In-memory stores for real-time candles: symbol → deque of bars
 REALTIME_CANDLES: Dict[str, deque] = {symbol: deque(maxlen=200) for symbol in TICKERS}
 REALTIME_LOCK = threading.Lock()
 
@@ -94,7 +94,7 @@ class HistoricalDataLoader:
 
 class RealTimeDataStreamer:
     """
-    Subscribe to Polygon's real-time WebSocket feed and aggregate per-minute trades
+    Subscribe to Polygon's real-time WebSocket feed and aggregate minute trades
     into 5-minute OHLCV bars stored in ``REALTIME_CANDLES``.
     """
 
@@ -108,9 +108,9 @@ class RealTimeDataStreamer:
         """Authenticate and subscribe on WebSocket open."""
         write_status("RT WS opened; authenticating…")
         ws.send(json.dumps({"action": "auth", "params": self.api_key}))
-        # use "A.{symbol}" for aggregate per-minute trades
+        # subscribe to aggregate‐minute streams (“AM.”)
         for ticker in TICKERS:
-            ws.send(json.dumps({"action": "subscribe", "params": f"A.{ticker}"}))
+            ws.send(json.dumps({"action": "subscribe", "params": f"AM.{ticker}"}))
 
     def on_message(self, ws: WebSocketApp, message: str) -> None:
         """Handle incoming WebSocket messages by aggregating into 5-minute bars."""
@@ -118,31 +118,36 @@ class RealTimeDataStreamer:
             payload = json.loads(message)
             items = payload if isinstance(payload, list) else [payload]
             for itm in items:
+                # only handle aggregate‐minute events
                 if itm.get("ev") != "AM":
                     continue
+
                 ts_ms = itm["t"]
                 dt = datetime.fromtimestamp(ts_ms / 1000, tz=pytz.UTC).astimezone(tz)
                 minute = (dt.minute // 5) * 5
                 bucket = dt.replace(minute=minute, second=0, microsecond=0)
                 bar_ts = int(bucket.timestamp() * 1000)
+
                 record = {
                     "timestamp": bar_ts,
-                    "open": itm.get("o"),
-                    "high": itm.get("h"),
-                    "low": itm.get("l"),
-                    "close": itm.get("c"),
-                    "volume": itm.get("v", 0),
+                    "open":      itm.get("o"),
+                    "high":      itm.get("h"),
+                    "low":       itm.get("l"),
+                    "close":     itm.get("c"),
+                    "volume":    itm.get("v", 0),
                 }
+
                 with REALTIME_LOCK:
                     dq = REALTIME_CANDLES.setdefault(itm["sym"], deque(maxlen=200))
                     if dq and dq[-1]["timestamp"] == bar_ts:
                         prev = dq[-1]
-                        prev["high"] = max(prev["high"], record["high"])
-                        prev["low"] = min(prev["low"], record["low"])
-                        prev["close"] = record["close"]
+                        prev["high"]   = max(prev["high"], record["high"])
+                        prev["low"]    = min(prev["low"], record["low"])
+                        prev["close"]  = record["close"]
                         prev["volume"] += record["volume"]
                     else:
                         dq.append(record)
+
         except Exception as exc:
             write_status(f"RT on_message error: {exc}")
 
@@ -167,7 +172,7 @@ class RealTimeDataStreamer:
                 on_close=self.on_close,
             )
             with self._ws_lock:
-                self._ws = ws  # keep a reference to prevent GC
+                self._ws = ws  # keep a reference alive
             ws.run_forever()
 
         thread = threading.Thread(target=_run, daemon=True)
