@@ -50,7 +50,7 @@ from utils import (
     fetch_option_greeks,
     append_signal_log,
 )
-from messaging import send_telegram
+from utils.messaging import send_telegram
 
 
 # ─── Prometheus metrics ────────────────────────────────────────────────────────
