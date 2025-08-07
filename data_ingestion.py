@@ -2,10 +2,10 @@
 
 This module defines two classes:
 
-* ``HistoricalDataLoader`` — fetches 5‑minute bars from Polygon's REST API,
+* ``HistoricalDataLoader`` — fetches 5-minute bars from Polygon's REST API,
   handling pagination and time filtering.
 * ``RealTimeDataStreamer`` — connects to Polygon's WebSocket API to
-  aggregate per‑minute trades into 5‑minute OHLCV bars in memory.
+  aggregate per-minute trades into 5-minute OHLCV bars in memory.
 
 Both classes adhere to simple rate limiting and provide structured
 access to streaming data.
@@ -28,13 +28,13 @@ from config import POLYGON_API_KEY, TICKERS, tz
 from utils.http_client import safe_fetch_polygon_data, rate_limited
 from utils.logging_utils import write_status
 
-# In‑memory stores for real‑time candles: symbol -> deque of bars
+# In-memory stores for real-time candles: symbol -> deque of bars
 REALTIME_CANDLES: Dict[str, deque] = {symbol: deque(maxlen=200) for symbol in TICKERS}
 REALTIME_LOCK = threading.Lock()
 
 
 class HistoricalDataLoader:
-    """Load historical 5‑minute bar data from Polygon's REST API."""
+    """Load historical 5-minute bar data from Polygon's REST API."""
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         self.api_key: str = api_key or POLYGON_API_KEY
@@ -56,7 +56,7 @@ class HistoricalDataLoader:
         end: datetime,
         limit: int = 5000,
     ) -> List[Dict[str, Any]]:
-        """Return a list of 5‑minute bars between ``start`` and ``end`` timestamps."""
+        """Return a list of 5-minute bars between ``start`` and ``end`` timestamps."""
         all_bars: List[Dict[str, Any]] = []
         next_url: Optional[str] = None
         start_ts = int(start.timestamp() * 1000)
@@ -94,13 +94,12 @@ class HistoricalDataLoader:
 
 class RealTimeDataStreamer:
     """
-    Subscribe to Polygon's real‑time WebSocket feed and aggregate minute trades
-    into 5‑minute OHLCV bars stored in ``REALTIME_CANDLES``.
+    Subscribe to Polygon's real-time WebSocket feed and aggregate per-minute trades
+    into 5-minute OHLCV bars stored in ``REALTIME_CANDLES``.
     """
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         self.api_key: str = api_key or POLYGON_API_KEY
-        # Real‑time WebSocket endpoint (use socket.polygon.io, not delayed)
         self.ws_url: str = "wss://socket.polygon.io/stocks"
         self._ws_lock = threading.Lock()
         self._ws: Optional[WebSocketApp] = None
@@ -109,11 +108,12 @@ class RealTimeDataStreamer:
         """Authenticate and subscribe on WebSocket open."""
         write_status("RT WS opened; authenticating…")
         ws.send(json.dumps({"action": "auth", "params": self.api_key}))
+        # use "A.{symbol}" for aggregate per-minute trades
         for ticker in TICKERS:
-            ws.send(json.dumps({"action": "subscribe", "params": f"AM.{ticker}"}))
+            ws.send(json.dumps({"action": "subscribe", "params": f"A.{ticker}"}))
 
     def on_message(self, ws: WebSocketApp, message: str) -> None:
-        """Handle incoming WebSocket messages by aggregating into 5‑minute bars."""
+        """Handle incoming WebSocket messages by aggregating into 5-minute bars."""
         try:
             payload = json.loads(message)
             items = payload if isinstance(payload, list) else [payload]
@@ -158,7 +158,6 @@ class RealTimeDataStreamer:
 
     def start(self) -> None:
         """Start the WebSocket streaming in a background daemon thread."""
-
         def _run() -> None:
             ws = WebSocketApp(
                 self.ws_url,
@@ -168,7 +167,7 @@ class RealTimeDataStreamer:
                 on_close=self.on_close,
             )
             with self._ws_lock:
-                self._ws = ws
+                self._ws = ws  # keep a reference to prevent GC
             ws.run_forever()
 
         thread = threading.Thread(target=_run, daemon=True)
