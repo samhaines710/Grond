@@ -25,11 +25,11 @@ from config import METRICS_PORT, HTTP_PORT, SERVICE_NAME
 
 # Module-level flags to enforce idempotency
 _metrics_server_started = False
-_http_server_started = False
+_http_server_started   = False
 
 
 def setup_logging() -> None:
-    """Set up structured logging for the application."""
+    """Set up structured JSON logging for the entire application."""
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     handler = logging.StreamHandler()
@@ -45,8 +45,8 @@ def setup_logging() -> None:
     root.addHandler(handler)
 
 
-# Prometheus Metrics
-REQUEST_COUNT = Counter(
+# ── Prometheus Metrics ─────────────────────────────────────────────────────────
+REQUEST_COUNT   = Counter(
     f"{SERVICE_NAME}_http_requests_total",
     "Total HTTP requests",
     ["method", "endpoint"],
@@ -56,25 +56,25 @@ REQUEST_LATENCY = Histogram(
     "HTTP request latency",
     ["endpoint"],
 )
-IN_PROGRESS = Gauge(
+IN_PROGRESS     = Gauge(
     f"{SERVICE_NAME}_inprogress_requests",
     "In-flight HTTP requests",
 )
 
-# Flask App
+# ── Flask App ───────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 
 @app.before_request
 def before_request() -> None:
-    """Track the start of a request for latency measurement."""
+    """Increment in-progress gauge and record start time."""
     IN_PROGRESS.inc()
     request._start_time = datetime.utcnow()
 
 
 @app.after_request
 def after_request(response):
-    """Record request metrics and decrement the in-progress counter."""
+    """Record latency, count the request, and decrement in-progress gauge."""
     elapsed = (datetime.utcnow() - request._start_time).total_seconds()
     REQUEST_LATENCY.labels(endpoint=request.path).observe(elapsed)
     REQUEST_COUNT.labels(method=request.method, endpoint=request.path).inc()
@@ -84,33 +84,30 @@ def after_request(response):
 
 @app.route("/metrics")
 def metrics():
-    """Expose Prometheus metrics."""
+    """Expose Prometheus metrics in text format."""
     data = generate_latest()
     return data, 200, {"Content-Type": CONTENT_TYPE_LATEST}
 
 
 @app.route("/health")
 def health():
-    """Simple health check endpoint."""
+    """Simple JSON health‐check endpoint."""
     return jsonify(status="ok", time=datetime.utcnow().isoformat() + "Z"), 200
 
 
 def start_monitoring_server() -> None:
     """
-    Launch Prometheus on METRICS_PORT (once, swallow EADDRINUSE) and launch
-    Flask on HTTP_PORT for /metrics and /health (once).
+    Launch Prometheus on METRICS_PORT (idempotent, swallow EADDRINUSE),
+    then launch Flask on HTTP_PORT (idempotent, swallow EADDRINUSE).
     """
     global _metrics_server_started, _http_server_started
 
     setup_logging()
     logger = logging.getLogger("monitoring_ops")
 
-    # Start Prometheus metrics endpoint
+    # ── Start Prometheus metrics endpoint ──────────────────────────────────
     if not _metrics_server_started:
-        logger.info(
-            "Starting Prometheus metrics server on port %s",
-            METRICS_PORT,
-        )
+        logger.info("Starting Prometheus metrics server on port %s", METRICS_PORT)
         try:
             start_http_server(METRICS_PORT)
             _metrics_server_started = True
@@ -131,21 +128,22 @@ def start_monitoring_server() -> None:
     else:
         logger.debug("Prometheus metrics server already started; skipping.")
 
-    # Start HTTP server for /metrics and /health
+    # ── Start Flask HTTP server ───────────────────────────────────────────
     if not _http_server_started:
-        logger.info(
-            "Starting Flask health & metrics server on port %s",
-            HTTP_PORT,
-        )
-        thread = threading.Thread(
-            target=lambda: app.run(
-                host="0.0.0.0",
-                port=HTTP_PORT,
-                debug=False,
-                use_reloader=False,
-            ),
-            daemon=True,
-        )
+        logger.info("Starting Flask health & metrics server on port %s", HTTP_PORT)
+        def _run_flask() -> None:
+            try:
+                app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False)
+            except OSError as exc:
+                if getattr(exc, "errno", None) == errno.EADDRINUSE:
+                    logging.getLogger("monitoring_ops").warning(
+                        "HTTP port %s already in use; skipping Flask server start.",
+                        HTTP_PORT,
+                    )
+                else:
+                    raise
+
+        thread = threading.Thread(target=_run_flask, daemon=True)
         thread.start()
         _http_server_started = True
     else:
