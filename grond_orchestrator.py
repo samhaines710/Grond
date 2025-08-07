@@ -52,7 +52,7 @@ from utils import (
     fetch_option_greeks,
     append_signal_log,
 )
-from messaging import send_telegram  # <— new import for Telegram notifications
+from utils.messaging import send_telegram  # <— new import for Telegram notifications
 
 # ─── Prometheus metrics ─────────────────────────────────────────────────────────
 SIGNALS_PROCESSED = Counter(
