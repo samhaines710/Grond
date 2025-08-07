@@ -26,7 +26,7 @@ BANDIT_EPSILON = float(os.getenv("BANDIT_EPSILON", "0.1"))
 TICKERS = [
     "TSLA", "AAPL", "MSFT", "NVDA",
     "NFLX", "AMZN", "META", "GOOG",
-    "CL", "NG",
+    "NIO", "IBIT",
 ]
 OPTIONS_TICKERS = TICKERS.copy()
 
@@ -41,8 +41,8 @@ DIVIDEND_YIELDS = {
     "AMZN": 0.00,
     "META": 0.002,
     "GOOG": 0.00,
-    "CL": 0.00,
-    "NG": 0.00,
+    "NIO": 0.00,
+    "IBIT": 0.00,
 }
 
 # === Single Fallback Volatility ===
