@@ -1,16 +1,16 @@
-# src/grond_orchestrator.py
+# grond_orchestrator.py
 
 """
 Central orchestrator for the Grond trading system.
 
-Coordinates real-time data streaming, feature engineering,
-classification, bandit exploration, strategy execution, and notifications.
+Coordinates real-time data streaming, feature engineering, classification,
+bandit exploration, strategy execution, and order placement.
 """
 
 from __future__ import annotations
 
-import time
 import logging
+import time
 from datetime import datetime
 from typing import Dict
 
@@ -25,6 +25,7 @@ from config import (
     tz,
 )
 from monitoring_ops import start_monitoring_server
+
 from data_ingestion import (
     HistoricalDataLoader,
     RealTimeDataStreamer,
@@ -36,6 +37,7 @@ from ml_classifier import MLClassifier
 from strategy_logic import StrategyLogic
 from signal_generation import BanditAllocator
 from execution_layer import ManualExecutor
+
 from utils import (
     write_status,
     reformat_candles,
@@ -50,10 +52,9 @@ from utils import (
     fetch_option_greeks,
     append_signal_log,
 )
-from utils.messaging import send_telegram
+from messaging import send_telegram  # <— new import for Telegram notifications
 
-
-# ─── Prometheus metrics ────────────────────────────────────────────────────────
+# ─── Prometheus metrics ─────────────────────────────────────────────────────────
 SIGNALS_PROCESSED = Counter(
     f"{SERVICE_NAME}_signals_total",
     "Number of signals generated",
@@ -67,10 +68,7 @@ EXECUTIONS = Counter(
 
 
 class GrondOrchestrator:
-    """
-    Central orchestrator for data ingestion, signal generation,
-    execution, and notifications.
-    """
+    """Central orchestrator for data ingestion, signal generation, and execution."""
 
     def __init__(self) -> None:
         logging.getLogger().setLevel(logging.INFO)
@@ -91,13 +89,13 @@ class GrondOrchestrator:
             epsilon=BANDIT_EPSILON,
         )
 
-        # Executor sends Telegram notifications
+        # Manual executor now uses send_telegram for notifications
         self.executor = ManualExecutor(notify_fn=send_telegram)
 
         write_status("GrondOrchestrator initialized.")
 
     def run(self) -> None:
-        """Main loop: on each 5-minute bar, compute features, classify, and possibly execute."""
+        """Main loop that processes new bars and acts on generated signals."""
         write_status("Entering main loop.")
         while True:
             now = datetime.now(tz)
@@ -111,33 +109,33 @@ class GrondOrchestrator:
                 bars = reformat_candles(raw)
 
                 # Feature calculation
-                breakout      = calculate_breakout_prob(bars)
-                recent_pct    = calculate_recent_move_pct(bars)
-                vol_ratio     = calculate_volume_ratio(bars)
-                rsi_val       = compute_rsi(bars)
-                corr_dev      = compute_corr_deviation(ticker)
-                skew          = compute_skew_ratio(ticker)
-                ys2           = detect_yield_spike("2year")
-                ys10          = detect_yield_spike("10year")
-                ys30          = detect_yield_spike("30year")
-                tod           = calculate_time_of_day(now)
-                greeks        = fetch_option_greeks(ticker)
+                breakout   = calculate_breakout_prob(bars)
+                recent_pct = calculate_recent_move_pct(ticker, bars)
+                vol_ratio  = calculate_volume_ratio(ticker, bars)
+                rsi_val    = compute_rsi(bars)
+                corr_dev   = compute_corr_deviation(ticker)
+                skew       = compute_skew_ratio(ticker)
+                ys2        = detect_yield_spike("2year")
+                ys10       = detect_yield_spike("10year")
+                ys30       = detect_yield_spike("30year")
+                tod        = calculate_time_of_day(now)
+                greeks     = fetch_option_greeks(ticker)
 
                 features: Dict[str, float] = {
                     **greeks,
-                    "breakout_prob":     breakout,
-                    "recent_move_pct":   recent_pct,
-                    "volume_ratio":      vol_ratio,
-                    "rsi":               rsi_val,
-                    "corr_dev":          corr_dev,
-                    "skew_ratio":        skew,
-                    "yield_spike_2year": ys2,
+                    "breakout_prob":      breakout,
+                    "recent_move_pct":    recent_pct,
+                    "volume_ratio":       vol_ratio,
+                    "rsi":                rsi_val,
+                    "corr_dev":           corr_dev,
+                    "skew_ratio":         skew,
+                    "yield_spike_2year":  ys2,
                     "yield_spike_10year": ys10,
                     "yield_spike_30year": ys30,
-                    "time_of_day":       tod,
+                    "time_of_day":        tod,
                 }
 
-                # Classification + ε-greedy exploration
+                # Classification + ε–greedy exploration
                 cls_out = self.classifier.classify(features)
                 base_mv = cls_out["movement_type"]
                 mv = (
@@ -146,10 +144,11 @@ class GrondOrchestrator:
                     else base_mv
                 )
 
-                # Execute strategy
                 context = {**features, **cls_out}
                 strat = self.logic.execute_strategy(mv, context)
-                SIGNALS_PROCESSED.labels(ticker=ticker, movement_type=mv).inc()
+                SIGNALS_PROCESSED.labels(
+                    ticker=ticker, movement_type=mv
+                ).inc()
 
                 action = strat["action"]
                 if action not in ("AVOID", "REVIEW"):
@@ -159,9 +158,12 @@ class GrondOrchestrator:
                         size=ORDER_SIZE,
                         side=side,
                     )
-                    EXECUTIONS.labels(ticker=ticker, action=action).inc()
+                    EXECUTIONS.labels(
+                        ticker=ticker,
+                        action=action,
+                    ).inc()
 
-                    # Log signal to CSV
+                    # Log to CSV
                     append_signal_log({
                         "time": now.isoformat(),
                         "ticker": ticker,
@@ -170,7 +172,7 @@ class GrondOrchestrator:
                         **greeks,
                     })
 
-            # Align loop to next 5-minute bar
+            # Sleep until next 5-minute bar
             time.sleep(300)
 
 
