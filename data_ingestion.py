@@ -173,8 +173,8 @@ class RealTimeDataStreamer:
                     # status/heartbeat/etc come through here — ignore quietly
                     continue
 
-                # Guard against missing fields to avoid KeyErrors
-                ts_ms = itm.get("t")
+                # AM frames use 's' (start) / 'e' (end) timestamps
+                ts_ms = itm.get("s") or itm.get("t")  # fall back to 't' if ever present
                 o = itm.get("o")
                 h = itm.get("h")
                 l = itm.get("l")
