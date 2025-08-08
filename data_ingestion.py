@@ -1,19 +1,16 @@
 """Data ingestion utilities for historical and real-time market data.
 
-This module defines two classes:
+- HistoricalDataLoader: fetches 5-minute bars from Polygon REST with pagination.
+- RealTimeDataStreamer: connects to Polygon WebSocket, aggregates into 5-minute OHLCV.
 
-* ``HistoricalDataLoader`` — fetches 5-minute bars from Polygon's REST API,
-  handling pagination and time filtering.
-* ``RealTimeDataStreamer`` — connects to Polygon's WebSocket API to
-  aggregate per-minute trades into 5-minute OHLCV bars in memory.
-
-Both classes adhere to simple rate limiting and provide structured
-access to streaming data.
+This version is robust to status/control WS messages (no KeyError 't') and will
+use the delayed socket by default unless USE_REALTIME_WEBSOCKET=1 is set.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -28,11 +25,12 @@ from config import POLYGON_API_KEY, TICKERS, tz
 from utils.http_client import safe_fetch_polygon_data, rate_limited
 from utils.logging_utils import write_status
 
-# In-memory stores for real-time candles: symbol -> deque of bars
+# ── In-memory stores for real-time candles ──────────────────────────────────────
 REALTIME_CANDLES: Dict[str, deque] = {symbol: deque(maxlen=200) for symbol in TICKERS}
 REALTIME_LOCK = threading.Lock()
 
 
+# ── Historical REST Loader ──────────────────────────────────────────────────────
 class HistoricalDataLoader:
     """Load historical 5-minute bar data from Polygon's REST API."""
 
@@ -41,12 +39,21 @@ class HistoricalDataLoader:
         self.base_url: str = "https://api.polygon.io"
 
     @rate_limited
-    def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Internal helper to perform a REST GET with rate limiting."""
-        query = params.copy()
-        query["apiKey"] = self.api_key
-        url = f"{self.base_url}{path}?{urlencode(query)}"
-        data: Dict[str, Any] = safe_fetch_polygon_data(url, ticker=path)
+    def _get(self, path_or_url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Internal helper to perform a REST GET with rate limiting.
+
+        Accepts either a relative `path` (we append base_url & params)
+        or a fully-qualified `next_url` returned by Polygon.
+        """
+        if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+            url = path_or_url
+        else:
+            q = params.copy()
+            q["apiKey"] = self.api_key
+            url = f"{self.base_url}{path_or_url}?{urlencode(q)}"
+
+        data: Dict[str, Any] = safe_fetch_polygon_data(url, ticker=path_or_url)
         return data or {}
 
     def fetch_bars(
@@ -56,7 +63,7 @@ class HistoricalDataLoader:
         end: datetime,
         limit: int = 5000,
     ) -> List[Dict[str, Any]]:
-        """Return a list of 5-minute bars between ``start`` and ``end`` timestamps."""
+        """Return a list of 5-minute bars between `start` and `end` (inclusive)."""
         all_bars: List[Dict[str, Any]] = []
         next_url: Optional[str] = None
         start_ts = int(start.timestamp() * 1000)
@@ -76,12 +83,13 @@ class HistoricalDataLoader:
                 }
                 data = self._get(path, params)
 
-            bars = data.get("results", [])
+            bars = data.get("results", []) or []
             if not bars:
                 break
 
             for bar in bars:
-                if start_ts <= bar["t"] <= end_ts:
+                t = bar.get("t")
+                if t is not None and start_ts <= t <= end_ts:
                     all_bars.append(bar)
 
             next_url = data.get("next_url")
@@ -92,76 +100,109 @@ class HistoricalDataLoader:
         return all_bars
 
 
+# ── Real-Time WebSocket Streamer ────────────────────────────────────────────────
 class RealTimeDataStreamer:
     """
-    Subscribe to Polygon's real-time WebSocket feed and aggregate per-minute trades
-    into 5-minute OHLCV bars stored in ``REALTIME_CANDLES``.
+    Subscribe to Polygon's WebSocket and aggregate minute events into 5-minute bars
+    stored in REALTIME_CANDLES.
     """
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         self.api_key: str = api_key or POLYGON_API_KEY
-        self.ws_url: str = "wss://socket.polygon.io/stocks"
+
+        # Use delayed feed by default to avoid policy violation (1008) on accounts
+        # without real-time entitlements. Set USE_REALTIME_WEBSOCKET=1 to force RT.
+        if os.getenv("USE_REALTIME_WEBSOCKET", "0").lower() in ("1", "true", "yes"):
+            self.ws_url: str = "wss://socket.polygon.io/stocks"
+        else:
+            self.ws_url: str = "wss://delayed.polygon.io/stocks"
+
         self._ws_lock = threading.Lock()
         self._ws: Optional[WebSocketApp] = None
+
+        # We subscribe to minute aggregates explicitly
+        self._agg_channel_prefix = "AM"  # minute aggregates
 
     def on_open(self, ws: WebSocketApp) -> None:
         """Authenticate and subscribe on WebSocket open."""
         write_status("RT WS opened; authenticating…")
         ws.send(json.dumps({"action": "auth", "params": self.api_key}))
-        # subscribe to the minute-aggregate channel ("AM.")
         for ticker in TICKERS:
-            ws.send(json.dumps({"action": "subscribe", "params": f"AM.{ticker}"}))
+            ws.send(json.dumps({"action": "subscribe", "params": f"{self._agg_channel_prefix}.{ticker}"}))
+
+    def _append_5m_bar(self, sym: str, ts_ms: int, o: float, h: float, l: float, c: float, v: float) -> None:
+        """Bucket Minute agg into 5-min OHLCV in a threadsafe way."""
+        # tz-aware bucketing
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=pytz.UTC).astimezone(tz)
+        minute = (dt.minute // 5) * 5
+        bucket = dt.replace(minute=minute, second=0, microsecond=0)
+        bar_ts = int(bucket.timestamp() * 1000)
+
+        rec = {
+            "timestamp": bar_ts,
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": v,
+        }
+
+        with REALTIME_LOCK:
+            dq = REALTIME_CANDLES.setdefault(sym, deque(maxlen=200))
+            if dq and dq[-1]["timestamp"] == bar_ts:
+                prev = dq[-1]
+                prev["high"] = max(prev["high"], rec["high"])
+                prev["low"] = min(prev["low"], rec["low"])
+                prev["close"] = rec["close"]
+                prev["volume"] += rec["volume"]
+            else:
+                dq.append(rec)
 
     def on_message(self, ws: WebSocketApp, message: str) -> None:
-        """Handle incoming WebSocket messages by aggregating into 5-minute bars."""
+        """Handle incoming WS messages; skip non-aggregate/status frames safely."""
         try:
             payload = json.loads(message)
             items = payload if isinstance(payload, list) else [payload]
             for itm in items:
-                # filter for minute‐aggregate events
-                if itm.get("ev") != "AM":
+                if not isinstance(itm, dict):
                     continue
 
-                ts_ms = itm["t"]
-                dt = datetime.fromtimestamp(ts_ms / 1000, tz=pytz.UTC).astimezone(tz)
-                minute = (dt.minute // 5) * 5
-                bucket = dt.replace(minute=minute, second=0, microsecond=0)
-                bar_ts = int(bucket.timestamp() * 1000)
-                record = {
-                    "timestamp": bar_ts,
-                    "open": itm.get("o"),
-                    "high": itm.get("h"),
-                    "low": itm.get("l"),
-                    "close": itm.get("c"),
-                    "volume": itm.get("v", 0),
-                }
+                ev = itm.get("ev")
+                # only handle minute aggregates
+                if ev != "AM":
+                    # status/heartbeat/etc come through here — ignore quietly
+                    continue
 
-                with REALTIME_LOCK:
-                    dq = REALTIME_CANDLES.setdefault(itm["sym"], deque(maxlen=200))
-                    if dq and dq[-1]["timestamp"] == bar_ts:
-                        prev = dq[-1]
-                        prev["high"] = max(prev["high"], record["high"])
-                        prev["low"] = min(prev["low"], record["low"])
-                        prev["close"] = record["close"]
-                        prev["volume"] += record["volume"]
-                    else:
-                        dq.append(record)
+                # Guard against missing fields to avoid KeyErrors
+                ts_ms = itm.get("t")
+                o = itm.get("o")
+                h = itm.get("h")
+                l = itm.get("l")
+                c = itm.get("c")
+                v = itm.get("v")
+                sym = itm.get("sym")
+
+                if None in (ts_ms, o, h, l, c, v) or not sym:
+                    # malformed aggregate; skip
+                    continue
+
+                self._append_5m_bar(sym, ts_ms, o, h, l, c, v)
 
         except Exception as exc:
-            write_status(f"RT on_message error: {exc}")
+            # Keep this quiet-ish to avoid spam; you can make this a debug if you want
+            write_status(f"RT on_message error: {exc!s}")
 
     def on_error(self, ws: WebSocketApp, err: Exception) -> None:
-        """Log WebSocket errors."""
         write_status(f"RT WS error: {err}")
 
     def on_close(self, ws: WebSocketApp, code: int, msg: str) -> None:
-        """Handle WebSocket closure and schedule a reconnect."""
         write_status(f"RT WS closed: {code}/{msg}; reconnecting in 5s")
         time.sleep(5)
         self.start()
 
     def start(self) -> None:
         """Start the WebSocket streaming in a background daemon thread."""
+
         def _run() -> None:
             ws = WebSocketApp(
                 self.ws_url,
@@ -171,7 +212,7 @@ class RealTimeDataStreamer:
                 on_close=self.on_close,
             )
             with self._ws_lock:
-                self._ws = ws  # keep a reference to prevent GC
+                self._ws = ws
             ws.run_forever()
 
         thread = threading.Thread(target=_run, daemon=True)
