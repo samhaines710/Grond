@@ -42,9 +42,9 @@ from utils import (
     write_status,
     reformat_candles,
     calculate_breakout_prob,
-    calculate_recent_move_pct,
+    calculate_recent_move_pct,   # expects bars ONLY
     calculate_time_of_day,
-    calculate_volume_ratio,
+    calculate_volume_ratio,      # expects bars ONLY
     compute_rsi,
     compute_corr_deviation,
     compute_skew_ratio,
@@ -52,7 +52,8 @@ from utils import (
     fetch_option_greeks,
     append_signal_log,
 )
-from utils.messaging import send_telegram  # <— new import for Telegram notifications
+from utils.messaging import send_telegram  # Telegram notifications
+
 
 # ─── Prometheus metrics ─────────────────────────────────────────────────────────
 SIGNALS_PROCESSED = Counter(
@@ -89,7 +90,7 @@ class GrondOrchestrator:
             epsilon=BANDIT_EPSILON,
         )
 
-        # Manual executor now uses send_telegram for notifications
+        # Manual executor uses Telegram for notifications
         self.executor = ManualExecutor(notify_fn=send_telegram)
 
         write_status("GrondOrchestrator initialized.")
@@ -110,8 +111,8 @@ class GrondOrchestrator:
 
                 # Feature calculation
                 breakout   = calculate_breakout_prob(bars)
-                recent_pct = calculate_recent_move_pct(ticker, bars)
-                vol_ratio  = calculate_volume_ratio(ticker, bars)
+                recent_pct = calculate_recent_move_pct(bars)   # <- fixed signature
+                vol_ratio  = calculate_volume_ratio(bars)      # <- fixed signature
                 rsi_val    = compute_rsi(bars)
                 corr_dev   = compute_corr_deviation(ticker)
                 skew       = compute_skew_ratio(ticker)
