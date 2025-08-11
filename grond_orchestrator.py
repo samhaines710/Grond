@@ -119,14 +119,13 @@ class GrondOrchestrator:
                 tod        = calculate_time_of_day(now)
                 greeks     = fetch_option_greeks(ticker)
 
-                # The trained model expects RAW columns listed in pipeline.feature_names_in_.
-                # Add theta_day/theta_5m so the classifier (and model) have them.
+                # Compute theta_day and theta_5m from raw theta
                 theta_raw = float(greeks.get("theta", 0.0))
-                theta_day = theta_raw                      # treat as per-day theta
-                theta_5m  = theta_day / 78.0              # 78 five-minute bars in RTH
+                theta_day = theta_raw
+                theta_5m  = theta_day / 78.0  # ~78 five-minute bars in regular session
 
                 features: Dict[str, float | str] = {
-                    # model-required engineered features
+                    # engineered features
                     "breakout_prob":      breakout,
                     "recent_move_pct":    recent_pct,
                     "volume_ratio":       vol_ratio,
@@ -136,9 +135,8 @@ class GrondOrchestrator:
                     "yield_spike_2year":  ys2,
                     "yield_spike_10year": ys10,
                     "yield_spike_30year": ys30,
-                    "time_of_day":        tod,      # RAW categorical string (e.g., "MORNING")
-
-                    # greeks (RAW numbers)
+                    "time_of_day":        tod,   # raw string (categorical)
+                    # greeks (raw numbers)
                     "delta":  float(greeks.get("delta", 0.0)),
                     "gamma":  float(greeks.get("gamma", 0.0)),
                     "theta":  theta_raw,
@@ -152,8 +150,7 @@ class GrondOrchestrator:
                     "zomma":  float(greeks.get("zomma", 0.0)),
                     "color":  float(greeks.get("color", 0.0)),
                     "implied_volatility": float(greeks.get("implied_volatility", 0.0)),
-
-                    # explicitly provide these two (model expects them as raw inputs)
+                    # additional required features for the model
                     "theta_day": theta_day,
                     "theta_5m":  theta_5m,
                 }
@@ -161,7 +158,11 @@ class GrondOrchestrator:
                 # Classification + ε–greedy exploration
                 cls_out = self.classifier.classify(features)
                 base_mv = cls_out["movement_type"]
-                mv = self.bandit.select_arm() if np.random.rand() < BANDIT_EPSILON else base_mv
+                mv = (
+                    self.bandit.select_arm()
+                    if np.random.rand() < BANDIT_EPSILON
+                    else base_mv
+                )
 
                 context = {**features, **cls_out}
                 strat = self.logic.execute_strategy(mv, context)
