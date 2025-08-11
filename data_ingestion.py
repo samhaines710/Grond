@@ -1,4 +1,5 @@
-"""Data ingestion utilities for historical and real-time market data.
+"""
+Data ingestion utilities for historical and real-time market data.
 
 - HistoricalDataLoader: fetches 5-minute bars from Polygon REST with pagination.
 - RealTimeDataStreamer: connects to Polygon WebSocket, aggregates into 5-minute OHLCV.
@@ -174,7 +175,7 @@ class RealTimeDataStreamer:
                     continue
 
                 # AM frames use 's' (start) / 'e' (end) timestamps
-                ts_ms = itm.get("s") or itm.get("t")  # fall back to 't' if ever present
+                ts_ms = itm.get("s") or itm.get("e")
                 o = itm.get("o")
                 h = itm.get("h")
                 l = itm.get("l")
