@@ -1,15 +1,17 @@
-"""Wrapper around a pre-trained XGBoost pipeline for movement classification.
+"""
+Wrapper around a pre-trained pipeline for movement classification.
 
-This class loads a pipeline from disk or optionally downloads it from S3.
-It provides a `classify` method to return a movement type and expected move
-percentage.
+Loads an sklearn pipeline (with a final XGBoost classifier) from disk,
+optionally downloading from S3 if missing. Uses the pipeline's RAW input
+schema (feature_names_in_) and safely fills any missing inputs with
+defaults so prediction doesn't crash if a feature is absent.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import joblib
 import boto3
@@ -17,71 +19,75 @@ from botocore.exceptions import BotoCoreError, ClientError
 import numpy as np
 import pandas as pd
 
-# Where to look for the model locally (inside the container)
+# Local model path (inside the container)
 DEFAULT_MODEL_PATH = "/app/models/xgb_classifier.pipeline.joblib"
 MODEL_PATH = os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH)
 
-# S3 settings for auto-download if the file is missing
+# S3 settings for auto-download if file is missing
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_MODEL_KEY = os.getenv("S3_MODEL_KEY", "models/xgb_classifier.pipeline.joblib")
 
-# Structured logger
+# Logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(
-            '{"timestamp":"%(asctime)s","level":"%(levelname)s",'
-            '"module":"%(module)s","message":"%(message)s"}'
-        )
-    )
-    logger.addHandler(handler)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter(
+        '{"timestamp":"%(asctime)s","level":"%(levelname)s","module":"%(module)s","message":"%(message)s"}'
+    ))
+    logger.addHandler(_h)
 
 
-def download_from_s3(bucket: str, key: str, dest: str) -> None:
-    """
-    Download the model artifact from S3 to the local path.
-    """
+def _download_from_s3(bucket: str, key: str, dest: str) -> None:
+    """Download the model artifact from S3 to the local path."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     s3 = boto3.client("s3")
-    try:
-        logger.info(f"Downloading model from s3://{bucket}/{key}")
-        s3.download_file(bucket, key, dest)
-        logger.info("Model downloaded successfully.")
-    except (ClientError, BotoCoreError) as exc:
-        logger.error(f"Failed to download model from S3: {exc}")
-        raise
+    logger.info(f"Downloading model from s3://{bucket}/{key}")
+    s3.download_file(bucket, key, dest)
+    logger.info("Model downloaded successfully.")
 
 
 class MLClassifier:
     """
-    ML-based movement classifier using a pre-trained XGBoost pipeline.
+    ML-based movement classifier using a pre-trained sklearn Pipeline.
+    It relies on `pipeline.feature_names_in_` for the RAW input columns.
     """
 
     def __init__(self, model_path: str = MODEL_PATH) -> None:
-        self.model_path: str = model_path
+        self.model_path = model_path
 
+        # Ensure model exists (download if configured)
         if not os.path.exists(self.model_path):
             if S3_BUCKET:
-                download_from_s3(S3_BUCKET, S3_MODEL_KEY, self.model_path)
+                try:
+                    _download_from_s3(S3_BUCKET, S3_MODEL_KEY, self.model_path)
+                except (ClientError, BotoCoreError) as exc:
+                    raise FileNotFoundError(f"Could not obtain model from S3: {exc}") from exc
             else:
-                logger.error(f"Model file not found at: {self.model_path}")
-                raise FileNotFoundError(
-                    f"Please ensure the model exists at {self.model_path}"
-                )
+                raise FileNotFoundError(f"Model file not found at: {self.model_path}")
 
         logger.info(f"Loading ML pipeline from {self.model_path}")
         self.pipeline = joblib.load(self.model_path)
         logger.info("ML pipeline loaded successfully.")
 
-        # Ensure feature_names were attached at training time
-        self.feature_names = getattr(self.pipeline, "feature_names", None)
-        if self.feature_names is None:
-            logger.error("Loaded pipeline missing `feature_names` attribute")
-            raise AttributeError(
-                "Loaded pipeline missing `feature_names` attribute"
-            )
+        # RAW input schema expected by the pipeline's preprocessor
+        cols = getattr(self.pipeline, "feature_names_in_", None)
+        if cols is None or len(cols) == 0:
+            raise AttributeError("Pipeline missing feature_names_in_. Re-export the model with sklearn>=1.0.")
+        self.input_cols: List[str] = list(cols)
+
+        # NOTE: Some artifacts also store transformed feature names in `feature_names`.
+        # Those are post-encoding and NOT what we should pass as inputs. We keep them
+        # only for reference.
+        self.transformed_cols: List[str] = list(getattr(self.pipeline, "feature_names", []) or [])
+
+    # ---- Defaults for any missing inputs -------------------------------------
+    def _default_for(self, col: str) -> Any:
+        if col == "time_of_day":
+            # Categorical bucket; orchestrator typically provides a string like "MORNING"
+            return "OFF_HOURS"
+        # numeric default
+        return 0.0
 
     def classify(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -89,38 +95,40 @@ class MLClassifier:
 
         Parameters
         ----------
-        data : Dict[str, Any]
-            dict of raw features; keys must match the pipeline's feature names.
+        data : dict
+            Raw features; keys SHOULD match pipeline.feature_names_in_. Any absent
+            keys are filled with safe defaults.
 
         Returns
         -------
-        Dict[str, Any]
-            {"movement_type": movement_type, "expected_move_pct": percentage}
+        dict: {"movement_type": <label>, "expected_move_pct": <prob*100>}
         """
-        try:
-            df = pd.DataFrame([data], columns=self.feature_names)
-        except Exception as exc:
-            logger.error(f"Error constructing input DataFrame: {exc!r}")
-            raise
+        # Build row aligned to RAW input schema
+        row = {}
+        missing = []
+        for col in self.input_cols:
+            if col in data and data[col] is not None:
+                row[col] = data[col]
+            else:
+                row[col] = self._default_for(col)
+                missing.append(col)
+
+        if missing:
+            logger.info(f"Filled missing model inputs with defaults: {missing}")
+
+        df = pd.DataFrame([row], columns=self.input_cols)
 
         proba = self.pipeline.predict_proba(df)[0]
         try:
             classes = self.pipeline.named_steps["xgb"].classes_
-        except (KeyError, AttributeError) as exc:
-            logger.error(f"Failed to retrieve classes from pipeline: {exc!r}")
-            raise
+        except Exception:
+            # Some pipelines store classes_ on the overall pipeline
+            classes = getattr(self.pipeline, "classes_", None)
+            if classes is None:
+                raise AttributeError("Could not locate classifier classes_ in the pipeline.")
 
         idx = int(np.argmax(proba))
-        movement_type = classes[idx]
-        expected_move_pct = float(proba[idx] * 100.0)
-
-        logger.debug(
-            "Classified movement_type=%s, expected_move_pct=%.2f",
-            movement_type,
-            expected_move_pct,
-        )
-
         return {
-            "movement_type": movement_type,
-            "expected_move_pct": expected_move_pct,
+            "movement_type": classes[idx],
+            "expected_move_pct": float(proba[idx] * 100.0),
         }
