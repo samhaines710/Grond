@@ -1,5 +1,3 @@
-# grond_orchestrator.py
-
 """
 Central orchestrator for the Grond trading system.
 
@@ -42,9 +40,9 @@ from utils import (
     write_status,
     reformat_candles,
     calculate_breakout_prob,
-    calculate_recent_move_pct,   # expects bars ONLY
+    calculate_recent_move_pct,
     calculate_time_of_day,
-    calculate_volume_ratio,      # expects bars ONLY
+    calculate_volume_ratio,
     compute_rsi,
     compute_corr_deviation,
     compute_skew_ratio,
@@ -52,8 +50,7 @@ from utils import (
     fetch_option_greeks,
     append_signal_log,
 )
-from utils.messaging import send_telegram  # Telegram notifications
-
+from utils.messaging import send_telegram  # notifications
 
 # ─── Prometheus metrics ─────────────────────────────────────────────────────────
 SIGNALS_PROCESSED = Counter(
@@ -111,8 +108,8 @@ class GrondOrchestrator:
 
                 # Feature calculation
                 breakout   = calculate_breakout_prob(bars)
-                recent_pct = calculate_recent_move_pct(bars)   # <- fixed signature
-                vol_ratio  = calculate_volume_ratio(bars)      # <- fixed signature
+                recent_pct = calculate_recent_move_pct(bars)  # expects bars only
+                vol_ratio  = calculate_volume_ratio(bars)     # expects bars only
                 rsi_val    = compute_rsi(bars)
                 corr_dev   = compute_corr_deviation(ticker)
                 skew       = compute_skew_ratio(ticker)
@@ -122,8 +119,14 @@ class GrondOrchestrator:
                 tod        = calculate_time_of_day(now)
                 greeks     = fetch_option_greeks(ticker)
 
-                features: Dict[str, float] = {
-                    **greeks,
+                # The trained model expects RAW columns listed in pipeline.feature_names_in_.
+                # Add theta_day/theta_5m so the classifier (and model) have them.
+                theta_raw = float(greeks.get("theta", 0.0))
+                theta_day = theta_raw                      # treat as per-day theta
+                theta_5m  = theta_day / 78.0              # 78 five-minute bars in RTH
+
+                features: Dict[str, float | str] = {
+                    # model-required engineered features
                     "breakout_prob":      breakout,
                     "recent_move_pct":    recent_pct,
                     "volume_ratio":       vol_ratio,
@@ -133,17 +136,32 @@ class GrondOrchestrator:
                     "yield_spike_2year":  ys2,
                     "yield_spike_10year": ys10,
                     "yield_spike_30year": ys30,
-                    "time_of_day":        tod,
+                    "time_of_day":        tod,      # RAW categorical string (e.g., "MORNING")
+
+                    # greeks (RAW numbers)
+                    "delta":  float(greeks.get("delta", 0.0)),
+                    "gamma":  float(greeks.get("gamma", 0.0)),
+                    "theta":  theta_raw,
+                    "vega":   float(greeks.get("vega", 0.0)),
+                    "rho":    float(greeks.get("rho", 0.0)),
+                    "vanna":  float(greeks.get("vanna", 0.0)),
+                    "vomma":  float(greeks.get("vomma", 0.0)),
+                    "charm":  float(greeks.get("charm", 0.0)),
+                    "veta":   float(greeks.get("veta", 0.0)),
+                    "speed":  float(greeks.get("speed", 0.0)),
+                    "zomma":  float(greeks.get("zomma", 0.0)),
+                    "color":  float(greeks.get("color", 0.0)),
+                    "implied_volatility": float(greeks.get("implied_volatility", 0.0)),
+
+                    # explicitly provide these two (model expects them as raw inputs)
+                    "theta_day": theta_day,
+                    "theta_5m":  theta_5m,
                 }
 
                 # Classification + ε–greedy exploration
                 cls_out = self.classifier.classify(features)
                 base_mv = cls_out["movement_type"]
-                mv = (
-                    self.bandit.select_arm()
-                    if np.random.rand() < BANDIT_EPSILON
-                    else base_mv
-                )
+                mv = self.bandit.select_arm() if np.random.rand() < BANDIT_EPSILON else base_mv
 
                 context = {**features, **cls_out}
                 strat = self.logic.execute_strategy(mv, context)
