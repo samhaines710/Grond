@@ -1,4 +1,4 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 """Prepare training data for movement classification.
 
 This script fetches historical OHLC bars, treasury yields, and option Greeks,
@@ -50,6 +50,11 @@ def fetch_treasury_yields(date: str | None = None) -> Dict[str, Any]:
     params: Dict[str, Any] = {"apiKey": POLYGON_API_KEY}
     if date:
         params["date"] = date
+    else:
+        # IMPORTANT: when no date is specified, get the most recent record
+        params["limit"] = 1
+        params["sort"] = "date.desc"
+
     resp = requests.get(YIELDS_ENDPOINT, params=params, timeout=10)
     resp.raise_for_status()
     results = resp.json().get("results", [])
@@ -103,6 +108,15 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
             for b in raw_bars
         ]
     )
+    if df.empty:
+        logger.warning("No bars for %s; returning empty frame", symbol)
+        return pd.DataFrame(columns=[
+            "symbol","breakout_prob","recent_move_pct","time_of_day","volume_ratio",
+            "rsi","corr_dev","skew_ratio","yield_spike_2year","yield_spike_10year",
+            "yield_spike_30year","delta","gamma","theta","vega","rho","vanna",
+            "vomma","movement_type","theta_day","theta_5m"
+        ])
+
     df["dt"] = (
         pd.to_datetime(df["timestamp"], unit="ms")
         .dt.tz_localize("UTC")
@@ -155,6 +169,11 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
         else:
             feat["movement_type"] = "NEUTRAL"
 
+        # explicit theta scaling
+        theta_raw = float(greeks.get("theta", 0.0))
+        feat["theta_day"] = theta_raw
+        feat["theta_5m"] = theta_raw / 78.0  # ~78 5-min bars in regular session
+
         records.append(feat)
 
     return pd.DataFrame(records)
@@ -167,7 +186,14 @@ def main() -> None:
         logger.info('Generating data for %s', t)
         out_frames.append(extract_features_and_label(t))
 
-    full = pd.concat(out_frames, ignore_index=True)
+    if not out_frames:
+        logger.error("No frames generated.")
+        return
+
+    full = pd.concat(out_frames, ignore_index=True) if len(out_frames) > 1 else out_frames[0]
+    if full.empty:
+        logger.warning("No rows generated; nothing to write.")
+        return
     full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
     full.to_csv(OUTPUT_PATH, index=False)
     logger.info('✅ Saved %d rows to %s', len(full), OUTPUT_PATH)
