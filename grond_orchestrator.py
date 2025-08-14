@@ -1,14 +1,16 @@
 """
 Central orchestrator for the Grond trading system.
 
-This version includes movement_type normalization to ensure numeric
-class identifiers produced by the ML classifier are converted into
-canonical string labels ("CALL", "PUT", "NEUTRAL").  It also
-logs any normalization for observability.
+This version:
+- Normalizes movement_type so numeric/NumPy IDs become "CALL"/"PUT"/"NEUTRAL".
+- GATES ε-greedy exploration to avoid trading when the base signal is NEUTRAL,
+  unless explicitly allowed via ALLOW_NEUTRAL_BANDIT.
+- Logs normalization and exploration decisions for auditability.
 """
 
 from __future__ import annotations
 
+import os
 import logging
 import time
 from datetime import datetime
@@ -19,7 +21,7 @@ from prometheus_client import Counter
 
 from config import (
     TICKERS,
-    BANDIT_EPSILON,
+    BANDIT_EPSILON,   # default epsilon (can be overridden by env)
     ORDER_SIZE,
     SERVICE_NAME,
     tz,
@@ -52,10 +54,10 @@ from utils import (
     fetch_option_greeks,
     append_signal_log,
 )
-from utils.movement import normalize_movement_type  # new import for normalization
-from utils.messaging import send_telegram  # notifications
+from utils.movement import normalize_movement_type
+from utils.messaging import send_telegram
 
-# ─── Prometheus metrics ─────────────────────────────────────────────────────────
+# ─── Prometheus metrics ────────────────────────────────────────────────────────
 SIGNALS_PROCESSED = Counter(
     f"{SERVICE_NAME}_signals_total",
     "Number of signals generated",
@@ -66,6 +68,12 @@ EXECUTIONS = Counter(
     "Number of executions placed",
     ["ticker", "action"],
 )
+
+# ─── Exploration controls (env-overridable) ───────────────────────────────────
+# Effective epsilon may be overridden at runtime without code changes.
+_EPSILON = float(os.getenv("BANDIT_EPSILON", str(BANDIT_EPSILON)))
+# Do we allow exploration to escalate NEUTRAL into CALL/PUT?
+_ALLOW_NEUTRAL_BANDIT = os.getenv("ALLOW_NEUTRAL_BANDIT", "0").lower() in {"1", "true", "yes"}
 
 class GrondOrchestrator:
     """Central orchestrator for data ingestion, signal generation, and execution."""
@@ -86,13 +94,48 @@ class GrondOrchestrator:
         self.logic = StrategyLogic()
         self.bandit = BanditAllocator(
             list(self.logic.logic_branches.keys()),
-            epsilon=BANDIT_EPSILON,
+            epsilon=_EPSILON,
         )
 
         # Manual executor uses Telegram for notifications
         self.executor = ManualExecutor(notify_fn=send_telegram)
 
-        write_status("GrondOrchestrator initialized.")
+        write_status(
+            f"GrondOrchestrator initialized (epsilon={_EPSILON}, "
+            f"allow_neutral_bandit={_ALLOW_NEUTRAL_BANDIT})"
+        )
+
+    def _decide_movement(self, base_mv: str) -> tuple[str, bool]:
+        """Return (final_mv, explored_flag) with exploration gating.
+
+        - Only explore away from CALL/PUT by default.
+        - NEUTRAL stays NEUTRAL unless ALLOW_NEUTRAL_BANDIT is enabled.
+        """
+        explored = False
+        mv = base_mv
+
+        roll = np.random.rand()
+        if base_mv in ("CALL", "PUT"):
+            if roll < _EPSILON:
+                cand = self.bandit.select_arm()
+                explored = (cand != base_mv)
+                mv = cand
+        elif base_mv == "NEUTRAL":
+            if _ALLOW_NEUTRAL_BANDIT and roll < _EPSILON:
+                cand = self.bandit.select_arm()
+                # Only escalate to an actionable arm
+                mv = "CALL" if cand == "CALL" else ("PUT" if cand == "PUT" else "NEUTRAL")
+                explored = (mv != base_mv)
+            else:
+                mv = "NEUTRAL"
+                explored = False
+        else:
+            # Unknown labels should never occur after normalization,
+            # but clamp to NEUTRAL if they do.
+            mv = "NEUTRAL"
+            explored = False
+
+        return mv, explored
 
     def run(self) -> None:
         """Main loop that processes new bars and acts on generated signals."""
@@ -110,8 +153,8 @@ class GrondOrchestrator:
 
                 # Feature calculation
                 breakout   = calculate_breakout_prob(bars)
-                recent_pct = calculate_recent_move_pct(bars)  # expects bars only
-                vol_ratio  = calculate_volume_ratio(bars)     # expects bars only
+                recent_pct = calculate_recent_move_pct(bars)
+                vol_ratio  = calculate_volume_ratio(bars)
                 rsi_val    = compute_rsi(bars)
                 corr_dev   = compute_corr_deviation(ticker)
                 skew       = compute_skew_ratio(ticker)
@@ -121,13 +164,11 @@ class GrondOrchestrator:
                 tod        = calculate_time_of_day(now)
                 greeks     = fetch_option_greeks(ticker)
 
-                # Compute theta_day and theta_5m from raw theta
                 theta_raw = float(greeks.get("theta", 0.0))
                 theta_day = theta_raw
                 theta_5m  = theta_day / 78.0  # ~78 five-minute bars in regular session
 
                 features: Dict[str, float | str] = {
-                    # engineered features
                     "breakout_prob":      breakout,
                     "recent_move_pct":    recent_pct,
                     "volume_ratio":       vol_ratio,
@@ -137,8 +178,7 @@ class GrondOrchestrator:
                     "yield_spike_2year":  ys2,
                     "yield_spike_10year": ys10,
                     "yield_spike_30year": ys30,
-                    "time_of_day":        tod,   # raw string (categorical)
-                    # greeks (raw numbers)
+                    "time_of_day":        tod,
                     "delta":  float(greeks.get("delta", 0.0)),
                     "gamma":  float(greeks.get("gamma", 0.0)),
                     "theta":  theta_raw,
@@ -152,31 +192,27 @@ class GrondOrchestrator:
                     "zomma":  float(greeks.get("zomma", 0.0)),
                     "color":  float(greeks.get("color", 0.0)),
                     "implied_volatility": float(greeks.get("implied_volatility", 0.0)),
-                    # additional required features for the model
                     "theta_day": theta_day,
                     "theta_5m":  theta_5m,
                 }
 
-                # Classification + ε–greedy exploration
+                # Classification
                 cls_out = self.classifier.classify(features)
                 raw_mv = cls_out.get("movement_type")
                 base_mv = normalize_movement_type(raw_mv)
                 if raw_mv != base_mv:
-                    # Log normalization for audit trail
                     write_status(f"Normalized movement_type {raw_mv!r} → {base_mv}")
-                # Propagate normalized label for downstream context/strategy
-                cls_out["movement_type"] = base_mv
-                mv = (
-                    self.bandit.select_arm()
-                    if np.random.rand() < BANDIT_EPSILON
-                    else base_mv
-                )
+
+                # Exploration with gating
+                mv, explored = self._decide_movement(base_mv)
+                if explored:
+                    write_status(f"Exploration override: base={base_mv} → chosen={mv}")
+                # Propagate normalized/final label for downstream consumers
+                cls_out["movement_type"] = mv
 
                 context = {**features, **cls_out}
                 strat = self.logic.execute_strategy(mv, context)
-                SIGNALS_PROCESSED.labels(
-                    ticker=ticker, movement_type=mv
-                ).inc()
+                SIGNALS_PROCESSED.labels(ticker=ticker, movement_type=mv).inc()
 
                 action = strat["action"]
                 if action not in ("AVOID", "REVIEW"):
@@ -186,12 +222,8 @@ class GrondOrchestrator:
                         size=ORDER_SIZE,
                         side=side,
                     )
-                    EXECUTIONS.labels(
-                        ticker=ticker,
-                        action=action,
-                    ).inc()
+                    EXECUTIONS.labels(ticker=ticker, action=action).inc()
 
-                    # Log to CSV
                     append_signal_log({
                         "time": now.isoformat(),
                         "ticker": ticker,
