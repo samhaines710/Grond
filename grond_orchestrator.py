@@ -1,8 +1,10 @@
 """
 Central orchestrator for the Grond trading system.
 
-Coordinates real-time data streaming, feature engineering, classification,
-bandit exploration, strategy execution, and order placement.
+This version includes movement_type normalization to ensure numeric
+class identifiers produced by the ML classifier are converted into
+canonical string labels ("CALL", "PUT", "NEUTRAL").  It also
+logs any normalization for observability.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from utils import (
     fetch_option_greeks,
     append_signal_log,
 )
+from utils.movement import normalize_movement_type  # new import for normalization
 from utils.messaging import send_telegram  # notifications
 
 # ─── Prometheus metrics ─────────────────────────────────────────────────────────
@@ -63,7 +66,6 @@ EXECUTIONS = Counter(
     "Number of executions placed",
     ["ticker", "action"],
 )
-
 
 class GrondOrchestrator:
     """Central orchestrator for data ingestion, signal generation, and execution."""
@@ -157,7 +159,13 @@ class GrondOrchestrator:
 
                 # Classification + ε–greedy exploration
                 cls_out = self.classifier.classify(features)
-                base_mv = cls_out["movement_type"]
+                raw_mv = cls_out.get("movement_type")
+                base_mv = normalize_movement_type(raw_mv)
+                if raw_mv != base_mv:
+                    # Log normalization for audit trail
+                    write_status(f"Normalized movement_type {raw_mv!r} → {base_mv}")
+                # Propagate normalized label for downstream context/strategy
+                cls_out["movement_type"] = base_mv
                 mv = (
                     self.bandit.select_arm()
                     if np.random.rand() < BANDIT_EPSILON
@@ -194,7 +202,6 @@ class GrondOrchestrator:
 
             # Sleep until next 5-minute bar
             time.sleep(300)
-
 
 if __name__ == "__main__":
     write_status("Launching Grond Orchestrator…")
