@@ -1,14 +1,11 @@
 """
 Central orchestrator for the Grond trading system.
 
-This version:
-- Enforces a SINGLETON lock at startup so only one instance can run.
-- Normalizes movement_type so numeric/NumPy IDs become "CALL"/"PUT"/"NEUTRAL".
-- GATES ε-greedy exploration so NEUTRAL does not escalate to a trade
-  unless ALLOW_NEUTRAL_BANDIT is explicitly enabled.
-- Adds a SAFETY CLAMP so no execution can occur on NEUTRAL when the
-  gate is off, even if some other path misbehaves.
-- Logs normalization and exploration decisions for auditability.
+- Singleton lock (file lock).
+- Movement normalization (ints/np.int64 → CALL/PUT/NEUTRAL).
+- Exploration gating (NEUTRAL doesn't trade unless ALLOW_NEUTRAL_BANDIT=1).
+- Safety clamp against accidental NEUTRAL execution.
+- Centralized JSON logging configured once at startup.
 """
 
 from __future__ import annotations
@@ -25,7 +22,7 @@ from prometheus_client import Counter
 
 from config import (
     TICKERS,
-    BANDIT_EPSILON,   # default epsilon (can be overridden by env)
+    BANDIT_EPSILON,
     ORDER_SIZE,
     SERVICE_NAME,
     tz,
@@ -44,8 +41,8 @@ from strategy_logic import StrategyLogic
 from signal_generation import BanditAllocator
 from execution_layer import ManualExecutor
 
+from utils.logging_utils import configure_logging, write_status
 from utils import (
-    write_status,
     reformat_candles,
     calculate_breakout_prob,
     calculate_recent_move_pct,
@@ -61,6 +58,9 @@ from utils import (
 from utils.movement import normalize_movement_type
 from utils.messaging import send_telegram
 
+# ─── Configure logging first ───────────────────────────────────────────────────
+configure_logging()
+
 # ─── Prometheus metrics ────────────────────────────────────────────────────────
 SIGNALS_PROCESSED = Counter(
     f"{SERVICE_NAME}_signals_total",
@@ -73,7 +73,7 @@ EXECUTIONS = Counter(
     ["ticker", "action"],
 )
 
-# ─── Exploration controls (env-overridable) ───────────────────────────────────
+# ─── Exploration controls ─────────────────────────────────────────────────────
 _EPSILON = float(os.getenv("BANDIT_EPSILON", str(BANDIT_EPSILON)))
 _ALLOW_NEUTRAL_BANDIT = os.getenv("ALLOW_NEUTRAL_BANDIT", "0").lower() in {"1", "true", "yes"}
 
@@ -81,13 +81,12 @@ _ALLOW_NEUTRAL_BANDIT = os.getenv("ALLOW_NEUTRAL_BANDIT", "0").lower() in {"1", 
 _LOCK_FILE = os.getenv("GROND_LOCK_FILE", "/tmp/grond_orchestrator.lock")
 _INSTANCE_ID = os.getenv("INSTANCE_ID", f"pid-{os.getpid()}")
 
-class GrondOrchestrator:
-    """Central orchestrator for data ingestion, signal generation, and execution."""
 
+class GrondOrchestrator:
     def __init__(self) -> None:
         logging.getLogger().setLevel(logging.INFO)
 
-        # Acquire singleton lock (non-blocking). If locked, exit immediately.
+        # Acquire singleton
         try:
             self._lock_fh = open(_LOCK_FILE, "w")
             fcntl.flock(self._lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -102,12 +101,11 @@ class GrondOrchestrator:
         write_status(f"[{_INSTANCE_ID}] Starting monitoring server…")
         start_monitoring_server()
 
-        # Data feeders
+        # Data & engines
         self.hist_loader = HistoricalDataLoader()
         self.rt_stream = RealTimeDataStreamer()
         self.rt_stream.start()
 
-        # Core engines
         self.pricer = DerivativesPricer()
         self.classifier = MLClassifier()
         self.logic = StrategyLogic()
@@ -115,25 +113,18 @@ class GrondOrchestrator:
             list(self.logic.logic_branches.keys()),
             epsilon=_EPSILON,
         )
-
-        # Manual executor uses Telegram for notifications
         self.executor = ManualExecutor(notify_fn=send_telegram)
 
         write_status(
-            f"[{_INSTANCE_ID}] GrondOrchestrator initialized "
-            f"(epsilon={_EPSILON}, allow_neutral_bandit={_ALLOW_NEUTRAL_BANDIT})"
+            f"[{_INSTANCE_ID}] Orchestrator ready (epsilon={_EPSILON}, "
+            f"allow_neutral_bandit={_ALLOW_NEUTRAL_BANDIT})"
         )
 
     def _decide_movement(self, base_mv: str) -> Tuple[str, bool]:
-        """Return (final_mv, explored_flag) with exploration gating.
-
-        - Only explore away from CALL/PUT by default.
-        - NEUTRAL stays NEUTRAL unless ALLOW_NEUTRAL_BANDIT is enabled.
-        """
         explored = False
         mv = base_mv
-
         roll = np.random.rand()
+
         if base_mv in ("CALL", "PUT"):
             if roll < _EPSILON:
                 cand = self.bandit.select_arm()
@@ -146,20 +137,16 @@ class GrondOrchestrator:
                 explored = (mv != base_mv)
             else:
                 mv = "NEUTRAL"
-                explored = False
         else:
             mv = "NEUTRAL"
-            explored = False
 
         return mv, explored
 
     def run(self) -> None:
-        """Main loop that processes new bars and acts on generated signals."""
         write_status(f"[{_INSTANCE_ID}] Entering main loop.")
         while True:
             now = datetime.now(tz)
             for ticker in TICKERS:
-                # Pull current 5-minute bars
                 with REALTIME_LOCK:
                     raw = list(REALTIME_CANDLES.get(ticker, []))
                 if len(raw) < 5:
@@ -167,7 +154,6 @@ class GrondOrchestrator:
 
                 bars = reformat_candles(raw)
 
-                # Feature calculation
                 breakout   = calculate_breakout_prob(bars)
                 recent_pct = calculate_recent_move_pct(bars)
                 vol_ratio  = calculate_volume_ratio(bars)
@@ -182,7 +168,7 @@ class GrondOrchestrator:
 
                 theta_raw = float(greeks.get("theta", 0.0))
                 theta_day = theta_raw
-                theta_5m  = theta_day / 78.0  # ~78 five-minute bars in regular session
+                theta_5m  = theta_day / 78.0
 
                 features: Dict[str, float | str] = {
                     "breakout_prob":      breakout,
@@ -212,39 +198,33 @@ class GrondOrchestrator:
                     "theta_5m":  theta_5m,
                 }
 
-                # Classification
                 cls_out = self.classifier.classify(features)
                 raw_mv = cls_out.get("movement_type")
                 base_mv = normalize_movement_type(raw_mv)
                 if raw_mv != base_mv:
                     write_status(f"[{_INSTANCE_ID}] Normalized movement_type {raw_mv!r} → {base_mv}")
 
-                # Exploration with gating
                 mv, explored = self._decide_movement(base_mv)
                 if explored:
                     write_status(f"[{_INSTANCE_ID}] Exploration override: base={base_mv} → chosen={mv}")
 
-                # Propagate final label
                 cls_out["movement_type"] = mv
                 context = {**features, **cls_out}
 
-                # Strategy decision
                 strat = self.logic.execute_strategy(mv, context)
                 SIGNALS_PROCESSED.labels(ticker=ticker, movement_type=mv).inc()
 
-                # SAFETY CLAMP: if NEUTRAL and neutral-bandit is disabled, never execute
+                # Safety clamp: NEUTRAL never executes if neutral-bandit is disabled
+                action = strat.get("action", "REVIEW")
                 if mv == "NEUTRAL" and not _ALLOW_NEUTRAL_BANDIT:
-                    if strat.get("action") not in ("AVOID", "REVIEW"):
+                    if action not in ("AVOID", "REVIEW"):
                         write_status(f"[{_INSTANCE_ID}] Safety clamp: preventing execution on NEUTRAL (ticker={ticker})")
                     action = "REVIEW"
-                else:
-                    action = strat.get("action", "REVIEW")
 
                 if action not in ("AVOID", "REVIEW"):
                     side = "buy" if action.endswith("_CALL") else "sell"
                     self.executor.place_order(ticker=ticker, size=ORDER_SIZE, side=side)
                     EXECUTIONS.labels(ticker=ticker, action=action).inc()
-
                     append_signal_log({
                         "time": now.isoformat(),
                         "ticker": ticker,
@@ -253,8 +233,8 @@ class GrondOrchestrator:
                         **greeks,
                     })
 
-            # Sleep until next 5-minute bar
             time.sleep(300)
+
 
 if __name__ == "__main__":
     write_status(f"[{_INSTANCE_ID}] Launching Grond Orchestrator…")
