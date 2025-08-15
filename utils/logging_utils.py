@@ -1,9 +1,17 @@
 """Centralized, JSON-formatted logging utilities (singleton configuration).
 
-- Configure a single root StreamHandler (JSON) exactly once.
-- Avoid duplicate handlers and double-logging.
-- Provide write_status() that attributes to the caller (stacklevel=2).
-- Export REST_CALLS and REST_LATENCY metrics for HTTP client instrumentation.
+Exports:
+- configure_logging(): install a single JSON StreamHandler on the root logger.
+- get_logger(): module logger that uses the root’s handler (no duplicates).
+- write_status(): convenience logger that attributes to the caller (stacklevel=2).
+- set_level(): adjust root log level dynamically.
+- REST_CALLS: Counter(service, endpoint, method, status) — outbound REST calls.
+- REST_LATENCY: Histogram(service, endpoint, method) — REST latency seconds.
+- REST_429: Counter(service, endpoint) — HTTP 429 rate-limit events.
+
+Design goals:
+- Avoid duplicate handlers / double-logging across modules.
+- Never crash if prometheus_client is unavailable (no-op shims).
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ __all__ = [
     "set_level",
     "REST_CALLS",
     "REST_LATENCY",
+    "REST_429",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -29,9 +38,8 @@ __all__ = [
 try:
     from prometheus_client import Counter, Histogram  # type: ignore
 except Exception:
-    # Minimal no-op shims so imports never fail in environments without Prometheus.
     class _NoopMetric:
-        def labels(self, *args: Any, **kwargs: Any) -> "._NoopMetric":  # noqa: F821
+        def labels(self, *args: Any, **kwargs: Any) -> "._NoopMetric":  # type: ignore
             return self
         def inc(self, *args: Any, **kwargs: Any) -> None:
             pass
@@ -54,6 +62,14 @@ REST_LATENCY = Histogram(
     "rest_call_latency_seconds",
     "Latency of outbound REST API calls in seconds",
     ["service", "endpoint", "method"],
+)
+
+# Rate-limit events (HTTP 429)
+# Labels chosen to match typical usage: REST_429.labels(service, endpoint).inc()
+REST_429 = Counter(
+    "rest_429_total",
+    "Count of HTTP 429 (rate-limited) responses from outbound REST calls",
+    ["service", "endpoint"],
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
