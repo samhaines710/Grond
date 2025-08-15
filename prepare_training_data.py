@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
- """Prepare training data for movement classification.
+"""Prepare training data for movement classification.
 
 This script fetches historical OHLC bars, treasury yields, and option Greeks,
 computes a sliding window of features and labels, and writes the result to
