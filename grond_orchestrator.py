@@ -2,19 +2,23 @@
 Central orchestrator for the Grond trading system.
 
 This version:
+- Enforces a SINGLETON lock at startup so only one instance can run.
 - Normalizes movement_type so numeric/NumPy IDs become "CALL"/"PUT"/"NEUTRAL".
-- GATES ε-greedy exploration to avoid trading when the base signal is NEUTRAL,
-  unless explicitly allowed via ALLOW_NEUTRAL_BANDIT.
+- GATES ε-greedy exploration so NEUTRAL does not escalate to a trade
+  unless ALLOW_NEUTRAL_BANDIT is explicitly enabled.
+- Adds a SAFETY CLAMP so no execution can occur on NEUTRAL when the
+  gate is off, even if some other path misbehaves.
 - Logs normalization and exploration decisions for auditability.
 """
 
 from __future__ import annotations
 
 import os
+import fcntl
 import logging
 import time
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 from prometheus_client import Counter
@@ -70,17 +74,32 @@ EXECUTIONS = Counter(
 )
 
 # ─── Exploration controls (env-overridable) ───────────────────────────────────
-# Effective epsilon may be overridden at runtime without code changes.
 _EPSILON = float(os.getenv("BANDIT_EPSILON", str(BANDIT_EPSILON)))
-# Do we allow exploration to escalate NEUTRAL into CALL/PUT?
 _ALLOW_NEUTRAL_BANDIT = os.getenv("ALLOW_NEUTRAL_BANDIT", "0").lower() in {"1", "true", "yes"}
+
+# ─── Singleton lock config ────────────────────────────────────────────────────
+_LOCK_FILE = os.getenv("GROND_LOCK_FILE", "/tmp/grond_orchestrator.lock")
+_INSTANCE_ID = os.getenv("INSTANCE_ID", f"pid-{os.getpid()}")
 
 class GrondOrchestrator:
     """Central orchestrator for data ingestion, signal generation, and execution."""
 
     def __init__(self) -> None:
         logging.getLogger().setLevel(logging.INFO)
-        write_status("Starting monitoring server…")
+
+        # Acquire singleton lock (non-blocking). If locked, exit immediately.
+        try:
+            self._lock_fh = open(_LOCK_FILE, "w")
+            fcntl.flock(self._lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_fh.truncate(0)
+            self._lock_fh.write(_INSTANCE_ID)
+            self._lock_fh.flush()
+            write_status(f"[{_INSTANCE_ID}] Acquired singleton lock: {_LOCK_FILE}")
+        except BlockingIOError:
+            write_status(f"[{_INSTANCE_ID}] Another instance holds {_LOCK_FILE}. Exiting.")
+            raise SystemExit(0)
+
+        write_status(f"[{_INSTANCE_ID}] Starting monitoring server…")
         start_monitoring_server()
 
         # Data feeders
@@ -101,11 +120,11 @@ class GrondOrchestrator:
         self.executor = ManualExecutor(notify_fn=send_telegram)
 
         write_status(
-            f"GrondOrchestrator initialized (epsilon={_EPSILON}, "
-            f"allow_neutral_bandit={_ALLOW_NEUTRAL_BANDIT})"
+            f"[{_INSTANCE_ID}] GrondOrchestrator initialized "
+            f"(epsilon={_EPSILON}, allow_neutral_bandit={_ALLOW_NEUTRAL_BANDIT})"
         )
 
-    def _decide_movement(self, base_mv: str) -> tuple[str, bool]:
+    def _decide_movement(self, base_mv: str) -> Tuple[str, bool]:
         """Return (final_mv, explored_flag) with exploration gating.
 
         - Only explore away from CALL/PUT by default.
@@ -123,15 +142,12 @@ class GrondOrchestrator:
         elif base_mv == "NEUTRAL":
             if _ALLOW_NEUTRAL_BANDIT and roll < _EPSILON:
                 cand = self.bandit.select_arm()
-                # Only escalate to an actionable arm
                 mv = "CALL" if cand == "CALL" else ("PUT" if cand == "PUT" else "NEUTRAL")
                 explored = (mv != base_mv)
             else:
                 mv = "NEUTRAL"
                 explored = False
         else:
-            # Unknown labels should never occur after normalization,
-            # but clamp to NEUTRAL if they do.
             mv = "NEUTRAL"
             explored = False
 
@@ -139,7 +155,7 @@ class GrondOrchestrator:
 
     def run(self) -> None:
         """Main loop that processes new bars and acts on generated signals."""
-        write_status("Entering main loop.")
+        write_status(f"[{_INSTANCE_ID}] Entering main loop.")
         while True:
             now = datetime.now(tz)
             for ticker in TICKERS:
@@ -201,27 +217,32 @@ class GrondOrchestrator:
                 raw_mv = cls_out.get("movement_type")
                 base_mv = normalize_movement_type(raw_mv)
                 if raw_mv != base_mv:
-                    write_status(f"Normalized movement_type {raw_mv!r} → {base_mv}")
+                    write_status(f"[{_INSTANCE_ID}] Normalized movement_type {raw_mv!r} → {base_mv}")
 
                 # Exploration with gating
                 mv, explored = self._decide_movement(base_mv)
                 if explored:
-                    write_status(f"Exploration override: base={base_mv} → chosen={mv}")
-                # Propagate normalized/final label for downstream consumers
-                cls_out["movement_type"] = mv
+                    write_status(f"[{_INSTANCE_ID}] Exploration override: base={base_mv} → chosen={mv}")
 
+                # Propagate final label
+                cls_out["movement_type"] = mv
                 context = {**features, **cls_out}
+
+                # Strategy decision
                 strat = self.logic.execute_strategy(mv, context)
                 SIGNALS_PROCESSED.labels(ticker=ticker, movement_type=mv).inc()
 
-                action = strat["action"]
+                # SAFETY CLAMP: if NEUTRAL and neutral-bandit is disabled, never execute
+                if mv == "NEUTRAL" and not _ALLOW_NEUTRAL_BANDIT:
+                    if strat.get("action") not in ("AVOID", "REVIEW"):
+                        write_status(f"[{_INSTANCE_ID}] Safety clamp: preventing execution on NEUTRAL (ticker={ticker})")
+                    action = "REVIEW"
+                else:
+                    action = strat.get("action", "REVIEW")
+
                 if action not in ("AVOID", "REVIEW"):
                     side = "buy" if action.endswith("_CALL") else "sell"
-                    self.executor.place_order(
-                        ticker=ticker,
-                        size=ORDER_SIZE,
-                        side=side,
-                    )
+                    self.executor.place_order(ticker=ticker, size=ORDER_SIZE, side=side)
                     EXECUTIONS.labels(ticker=ticker, action=action).inc()
 
                     append_signal_log({
@@ -236,6 +257,6 @@ class GrondOrchestrator:
             time.sleep(300)
 
 if __name__ == "__main__":
-    write_status("Launching Grond Orchestrator…")
+    write_status(f"[{_INSTANCE_ID}] Launching Grond Orchestrator…")
     orchestrator = GrondOrchestrator()
     orchestrator.run()
