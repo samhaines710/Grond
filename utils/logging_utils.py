@@ -1,52 +1,79 @@
-# utils/logging_utils.py
+"""Centralized, JSON-formatted logging utilities (singleton configuration).
 
-"""
-Structured logging and Prometheus counters for REST calls and 429s,
-plus a simple status‐file writer.
+- Configure a single root StreamHandler (JSON) exactly once.
+- Avoid duplicate handlers and double-logging.
+- Provide write_status() that attributes to the caller (stacklevel=2).
 """
 
-import os
+from __future__ import annotations
+
+import json
 import logging
-from datetime import datetime
-from prometheus_client import Counter
-from config import STATUS_FILE, SERVICE_NAME
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
-# ── Structured Logger ────────────────────────────────────────────────────────────
-logger = logging.getLogger(SERVICE_NAME)
-logger.setLevel(logging.INFO)
-# Clear existing handlers to avoid duplicates
-logger.handlers.clear()
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter(
-    '{"timestamp":"%(asctime)s","level":"%(levelname)s",'
-    '"module":"%(module)s","message":"%(message)s"}'
-))
-logger.addHandler(handler)
+__all__ = ["configure_logging", "get_logger", "write_status", "set_level"]
 
-# ── Prometheus Counters ──────────────────────────────────────────────────────────
-# (server is started in monitoring_ops.start_monitoring_server)
-REST_CALLS = Counter(
-    f"{SERVICE_NAME}_rest_calls_total",
-    "Total REST calls made"
-)
-REST_429 = Counter(
-    f"{SERVICE_NAME}_rest_429_total",
-    "Total HTTP 429 responses received"
-)
+_CONFIGURED = False
 
-# ── Status File Writer ───────────────────────────────────────────────────────────
-def write_status(msg: str) -> None:
-    """
-    Log a status message (to stdout via structured logger) and append it to STATUS_FILE.
-    """
-    # Log via structured JSON logger
-    logger.info(msg)
 
-    # Append timestamped message to STATUS_FILE
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+class JsonFormatter(logging.Formatter):
+    """Minimal JSON line formatter: timestamp, level, module, message."""
+
+    def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
+        # timestamp in ISO 8601 with UTC 'Z'
+        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S,%f"
+        )[:-3]
+        payload: Dict[str, Any] = {
+            "timestamp": ts,
+            "level": record.levelname,
+            "module": record.name or record.module,
+            "message": record.getMessage(),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Install a single JSON StreamHandler on the root logger. Idempotent."""
+    global _CONFIGURED
+    if _CONFIGURED:
+        return
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Remove any pre-existing handlers to stop duplicate lines.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    root.addHandler(handler)
+
+    # Prevent libraries from adding noisy extra handlers through propagation.
+    logging.captureWarnings(True)
+
+    _CONFIGURED = True
+
+
+def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """Return a module logger without adding handlers (uses root’s single handler)."""
+    return logging.getLogger(name if name else __name__)
+
+
+def write_status(msg: str, level: int = logging.INFO) -> None:
+    """Log a status line, attributed to the **caller** (not this helper)."""
+    logger = logging.getLogger(__name__)
+    # stacklevel=2 attributes module/line to the immediate caller if Python>=3.8
     try:
-        os.makedirs(os.path.dirname(STATUS_FILE) or ".", exist_ok=True)
-        with open(STATUS_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{ts} | {msg}\n")
-    except Exception as e:
-        logger.error(f"Failed to write status to {STATUS_FILE}: {e}")
+        logger.log(level, msg, stacklevel=2)
+    except TypeError:
+        # Fallback for very old Python: attribute to this module
+        logger.log(level, msg)
+
+
+def set_level(level: int) -> None:
+    """Dynamically raise/lower root log level."""
+    logging.getLogger().setLevel(level)
