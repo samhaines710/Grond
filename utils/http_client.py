@@ -1,241 +1,235 @@
-"""HTTP client helpers for REST access to the Polygon API.
+"""HTTP client helpers with metrics, retries, and Polygon utilities.
 
-This module encapsulates circuit breaker and rate limiter logic to
-protect the application from excessive requests. It also provides
-functions to fetch option Greeks via the Polygon snapshot API,
-falling back to local calculations when necessary.
+Key fixes:
+- Always provide labels to Prometheus metrics (no more 'missing label values').
+- Record latency via REST_LATENCY with (service, endpoint, method) labels.
+- Count 429s via REST_429 and back off with jittered retries.
+- Expose safe_fetch_polygon_data() and fetch_option_greeks().
+- Provide a rate_limited decorator compatible with existing imports.
+
+Environment variables:
+- HTTP_TIMEOUT_SECONDS (default: 10)
+- HTTP_MAX_RETRIES (default: 3)
+- HTTP_BACKOFF_BASE (seconds, default: 0.6)
+- HTTP_BACKOFF_MAX (seconds, default: 5.0)
+- POLYGON_API_KEY (required for Polygon endpoints)
 """
 
 from __future__ import annotations
 
-import math
-import threading
+import os
 import time
-from typing import Any, Callable, Dict, Optional
+import math
+import random
+import logging
+from typing import Any, Dict, Optional, Callable, TypeVar, cast
+from urllib.parse import urlparse
 
 import requests
 
-from config import POLYGON_API_KEY, DEFAULT_VOLATILITY_FALLBACK
-from utils.logging_utils import write_status, REST_CALLS, REST_429
-from utils.greeks_helpers import calculate_all_greeks
+from utils.logging_utils import (
+    REST_CALLS,
+    REST_LATENCY,
+    REST_429,
+    get_logger,
+)
 
+T = TypeVar("T")
 
-class CircuitBreaker:
-    """Simple circuit breaker that opens after consecutive failures."""
+logger = get_logger(__name__)
 
-    def __init__(self, threshold: int = 5, cooloff_secs: int = 60) -> None:
-        self.fail_count = 0
-        self.threshold = threshold
-        self.open_until: Optional[float] = None
-        self.cooloff_secs = cooloff_secs
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "10"))
+HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))
+HTTP_BACKOFF_BASE = float(os.getenv("HTTP_BACKOFF_BASE", "0.6"))
+HTTP_BACKOFF_MAX = float(os.getenv("HTTP_BACKOFF_MAX", "5.0"))
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 
-    def record_failure(self) -> None:
-        """Increment failure count and open breaker if threshold reached."""
-        self.fail_count += 1
-        if self.fail_count >= self.threshold:
-            self.open_until = time.time() + self.cooloff_secs
-            write_status(f"Circuit open until {self.open_until}")
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
-    def record_success(self) -> None:
-        """Reset the circuit breaker state on success."""
-        self.fail_count = 0
-        self.open_until = None
+def _service_from_url(url: str) -> str:
+    netloc = urlparse(url).netloc.lower()
+    if "api.polygon.io" in netloc:
+        return "polygon"
+    return netloc or "unknown"
 
-    def is_open(self) -> bool:
-        """Return ``True`` if the circuit breaker is currently open."""
-        if self.open_until and time.time() < self.open_until:
-            return True
-        self.open_until = None
-        return False
+def _endpoint_from_url(url: str) -> str:
+    p = urlparse(url)
+    # Use path; include version + first two segments for cardinality control
+    parts = [seg for seg in p.path.split("/") if seg]
+    if not parts:
+        return "/"
+    # cap to first 4 parts to avoid high-cardinality labels
+    return "/" + "/".join(parts[:4])
 
+def _sleep_backoff(attempt: int) -> None:
+    # Exponential backoff with jitter, capped
+    base = HTTP_BACKOFF_BASE * (2 ** max(attempt - 1, 0))
+    delay = min(base * (0.7 + 0.6 * random.random()), HTTP_BACKOFF_MAX)
+    time.sleep(delay)
 
-breaker = CircuitBreaker()
+# -----------------------------------------------------------------------------
+# Decorator: rate_limited
+# -----------------------------------------------------------------------------
 
-
-class RateLimiter:
-    """Token-bucket rate limiter used to control API call frequency."""
-
-    def __init__(self, rate_per_sec: float, burst_sec: int) -> None:
-        self.rate = rate_per_sec
-        self.cap = burst_sec
-        self.tokens = float(burst_sec)
-        self.timestamp = time.time()
-        self.lock = threading.Lock()
-
-    def acquire(self) -> bool:
-        """Attempt to consume a token; return ``True`` if successful."""
-        with self.lock:
-            now = time.time()
-            delta = now - self.timestamp
-            # Refill tokens based on elapsed time
-            self.tokens = min(self.cap, self.tokens + delta * self.rate)
-            self.timestamp = now
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return True
-            return False
-
-    def wait(self) -> None:
-        """Block until a token is available."""
-        while not self.acquire():
-            time.sleep(0.01)
-
-
-limiter = RateLimiter(rate_per_sec=5.0, burst_sec=10)
-
-
-def rate_limited(func: Callable) -> Callable:
-    """Decorator to apply the rate limiter to functions."""
-
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        limiter.wait()
-        return func(*args, **kwargs)
-
+def rate_limited(func: Callable[..., T]) -> Callable[..., T]:
+    """Retry wrapper with backoff for transient HTTP failures (incl. 429)."""
+    def wrapper(*args: Any, **kwargs: Any) -> T:
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, HTTP_MAX_RETRIES + 1):
+            try:
+                return func(*args, **kwargs)
+            except requests.HTTPError as e:
+                last_exc = e
+                status = getattr(e.response, "status_code", None)
+                if status == 429:
+                    # metric for rate-limit
+                    url = kwargs.get("url") or (args[0] if args else "")
+                    service = _service_from_url(str(url))
+                    endpoint = _endpoint_from_url(str(url))
+                    REST_429.labels(service, endpoint).inc()
+                # Backoff and retry for 5xx and 429; otherwise break fast
+                if status and status not in (429,) and status < 500:
+                    break
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_exc = e
+            if attempt < HTTP_MAX_RETRIES:
+                _sleep_backoff(attempt + 1)
+        assert last_exc is not None
+        raise last_exc
     return wrapper
+
+# -----------------------------------------------------------------------------
+# Core HTTP with metrics
+# -----------------------------------------------------------------------------
+
+def _request_with_metrics(
+    method: str,
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: Optional[float] = None,
+) -> requests.Response:
+    """Perform an HTTP request, emitting labeled Prometheus metrics."""
+    service = _service_from_url(url)
+    endpoint = _endpoint_from_url(url)
+    method_up = method.upper()
+
+    start = time.monotonic()
+    try:
+        resp = requests.request(
+            method_up,
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout or HTTP_TIMEOUT,
+        )
+        status = resp.status_code
+        return resp
+    finally:
+        elapsed = max(time.monotonic() - start, 0.0)
+        # We cannot access status here if exception thrown before resp exists.
+        # So we emit latency first (status-agnostic), then handle in callers.
+        REST_LATENCY.labels(service, endpoint, method_up).observe(elapsed)
 
 
 @rate_limited
-def safe_fetch_polygon_data(
-    url: str,
-    ticker: str = "",
-    retries: int = 3,
-) -> Dict[str, Any]:
-    """
-    Fetch JSON from the Polygon API and handle rate limits,
-    HTTP 429 responses, and the circuit breaker.
+def safe_fetch_polygon_data(url: str, ticker: Optional[str] = None) -> Dict[str, Any]:
+    """GET JSON with retries, metrics, and error handling for Polygon endpoints."""
+    # Ensure API key present in URL; if not, append it.
+    if "apiKey=" not in url and POLYGON_API_KEY:
+        sep = "&" if ("?" in url) else "?"
+        url = f"{url}{sep}apiKey={POLYGON_API_KEY}"
 
-    Parameters
-    ----------
-    url: str
-        The full URL to request.
-    ticker: str, optional
-        A label used for logging purposes when retrying requests.
-    retries: int, optional
-        Number of retry attempts before giving up.
+    service = _service_from_url(url)
+    endpoint = _endpoint_from_url(url)
+    method = "GET"
 
-    Returns
-    -------
-    Dict[str, Any]
-        The JSON response from the API, or an empty dict on failure.
-    """
-    if breaker.is_open():
-        write_status(f"Skipping REST call to {url} (circuit open)")
-        return {}
-
-    REST_CALLS.inc()
-    for attempt in range(retries):
-        try:
-            resp = requests.get(url, timeout=7)
-            if resp.status_code == 429:
-                REST_429.inc()
-                breaker.record_failure()
-                write_status(f"429 from Polygon for {ticker}")
-                time.sleep(2 ** attempt)
-                continue
-            resp.raise_for_status()
-            breaker.record_success()
-            return resp.json()  # type: ignore[no-any-return]
-        except Exception as exc:
-            write_status(f"Request error for {ticker}: {exc}")
-            time.sleep(2 ** attempt)
-
-    write_status(f"Failed to fetch data after {retries} attempts: {ticker}")
-    return {}
-
-
-def fetch_option_greeks(
-    ticker: str,
-    days_to_expiry: int = 30,
-    typ: str = "call",
-) -> Dict[str, Any]:
-    """
-    Attempt to obtain option Greeks from the Polygon snapshot API.
-
-    If snapshot data is unavailable, fall back to computing Greeks
-    using realized volatility derived from recent price data.
-
-    Parameters
-    ----------
-    ticker: str
-        Underlying symbol to fetch Greeks for.
-    days_to_expiry: int, optional
-        Days until the option expires; used in fallback calculations.
-    typ: str, optional
-        Option type: ``"call"`` or ``"put"``.
-
-    Returns
-    -------
-    Dict[str, Any]
-        A dictionary of option Greek values.
-    """
-    # Attempt 1: Polygon snapshot API
-    url = (
-        f"https://api.polygon.io/v3/snapshot/options/{ticker}"
-        f"?apiKey={POLYGON_API_KEY}"
-    )
-    results = safe_fetch_polygon_data(url, ticker).get("results", [])
-
-    if results:
-        same_type = [
-            o
-            for o in results
-            if o.get("details", {}).get("contract_type", "").lower() == typ
-        ]
-        candidates = same_type or results
-
-        # Select near‑ATM (closest strike) option
-        opt = min(
-            candidates,
-            key=lambda o: abs(
-                o["details"]["strike_price"]
-                - o["underlying_asset"]["price"]
-            ),
+    resp: requests.Response
+    try:
+        resp = _request_with_metrics(method, url)
+        status = resp.status_code
+        REST_CALLS.labels(service, endpoint, method, str(status)).inc()
+        # Handle 429 metric explicitly
+        if status == 429:
+            REST_429.labels(service, endpoint).inc()
+        resp.raise_for_status()
+        data = cast(Dict[str, Any], resp.json())
+        return data
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", "ERR")
+        REST_CALLS.labels(service, endpoint, method, str(status)).inc()
+        logger.info(
+            "Request error for %s: %s", ticker or endpoint, f"{status} {str(e)}"
         )
-        pg = opt.get("greeks", {})
-        if pg:
-            write_status(f"Used Polygon {typ} Greeks for {ticker}")
-            return {
-                "delta": pg.get("delta", 0.0),
-                "gamma": pg.get("gamma", 0.0),
-                "theta": pg.get("theta", 0.0),
-                "vega": pg.get("vega", 0.0),
-                "rho": pg.get("rho", 0.0),
-                "vanna": pg.get("vanna", 0.0),
-                "vomma": pg.get("vomma", 0.0),
-                "charm": pg.get("charm", 0.0),
-                "veta": pg.get("veta", 0.0),
-                "speed": pg.get("speed", 0.0),
-                "zomma": pg.get("zomma", 0.0),
-                "color": pg.get("color", 0.0),
-                "implied_volatility": opt.get("implied_volatility", 0.0),
-            }
+        raise
+    except (requests.ConnectionError, requests.Timeout) as e:
+        REST_CALLS.labels(service, endpoint, method, "NETWORK").inc()
+        logger.info("Network error for %s: %s", ticker or endpoint, str(e))
+        raise
+    except Exception as e:
+        REST_CALLS.labels(service, endpoint, method, "EXC").inc()
+        logger.info("Unexpected error for %s: %s", ticker or endpoint, str(e))
+        raise
 
-    # Fallback: compute Greeks using realized volatility
-    from utils.market_data import REALTIME_CANDLES  # local import to avoid cycles
+# -----------------------------------------------------------------------------
+# Greeks fetcher (aggregated snapshot). Returns floats for known keys.
+# -----------------------------------------------------------------------------
 
-    with threading.Lock():
-        bars = list(REALTIME_CANDLES.get(ticker, []))
+_GREK_KEYS = (
+    "delta", "gamma", "theta", "vega", "rho",
+    "vanna", "vomma", "charm", "veta", "speed", "zomma", "color",
+    "implied_volatility",
+)
 
-    sigma = DEFAULT_VOLATILITY_FALLBACK
-    if len(bars) >= 2:
-        rets = [
-            math.log(bars[i]["close"] / bars[i - 1]["close"])
-            for i in range(1, len(bars))
-            if bars[i - 1]["close"] > 0
-        ]
-        if rets:
-            mean_ret = sum(rets) / len(rets)
-            var_ret = sum((r - mean_ret) ** 2 for r in rets) / max(len(rets) - 1, 1)
-            sigma = math.sqrt(var_ret * 78 * 252)
+def _zeros_greeks(source: str) -> Dict[str, float | str]:
+    g: Dict[str, float | str] = {k: 0.0 for k in _GREK_KEYS}
+    g["source"] = source
+    return g
 
-    greeks = calculate_all_greeks(
-        S=bars[-1]["close"] if bars else 100.0,
-        K=bars[-1]["close"] if bars else 100.0,
-        T=days_to_expiry / 365.0,
-        ticker=ticker,
-        typ=typ,
-        sigma_override=sigma,
-    )
-    greeks["implied_volatility"] = sigma
-    write_status(f"Calculated fallback {typ} Greeks for {ticker} with σ={sigma:.3f}")
-    return greeks
+def _avg(nums: list[float]) -> float:
+    if not nums:
+        return 0.0
+    return sum(nums) / float(len(nums))
+
+def fetch_option_greeks(ticker: str) -> Dict[str, float | str]:
+    """
+    Fetch an aggregated view of option Greeks for the underlying from Polygon.
+    We average over available contracts in the snapshot (crude but stable).
+    Fallback returns zeros and 'source'='fallback'.
+    """
+    if not POLYGON_API_KEY:
+        # No key: immediate fallback
+        return _zeros_greeks("fallback")
+
+    url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
+    try:
+        data = safe_fetch_polygon_data(url, ticker=ticker)
+        results = data.get("results") or []
+        if not isinstance(results, list) or not results:
+            return _zeros_greeks("fallback")
+
+        # Collect greeks if present
+        buckets: Dict[str, list[float]] = {k: [] for k in _GREK_KEYS}
+        for opt in results:
+            greeks = opt.get("greeks") or {}
+            for k in _GREK_KEYS:
+                val = greeks.get(k)
+                try:
+                    fv = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(fv):
+                    buckets[k].append(fv)
+
+        out: Dict[str, float | str] = {k: _avg(buckets[k]) for k in _GREK_KEYS}
+        out["source"] = "polygon"
+        return out
+    except Exception:
+        # Any failure: fallback greeks
+        return _zeros_greeks("fallback")
