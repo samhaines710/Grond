@@ -3,26 +3,69 @@
 - Configure a single root StreamHandler (JSON) exactly once.
 - Avoid duplicate handlers and double-logging.
 - Provide write_status() that attributes to the caller (stacklevel=2).
+- Export REST_CALLS and REST_LATENCY metrics for HTTP client instrumentation.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-__all__ = ["configure_logging", "get_logger", "write_status", "set_level"]
+__all__ = [
+    "configure_logging",
+    "get_logger",
+    "write_status",
+    "set_level",
+    "REST_CALLS",
+    "REST_LATENCY",
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Prometheus metrics (safe no-op shims if prometheus_client is unavailable)
+# ──────────────────────────────────────────────────────────────────────────────
+
+try:
+    from prometheus_client import Counter, Histogram  # type: ignore
+except Exception:
+    # Minimal no-op shims so imports never fail in environments without Prometheus.
+    class _NoopMetric:
+        def labels(self, *args: Any, **kwargs: Any) -> "._NoopMetric":  # noqa: F821
+            return self
+        def inc(self, *args: Any, **kwargs: Any) -> None:
+            pass
+        def observe(self, *args: Any, **kwargs: Any) -> None:
+            pass
+    def Counter(*args: Any, **kwargs: Any) -> _NoopMetric:  # type: ignore
+        return _NoopMetric()
+    def Histogram(*args: Any, **kwargs: Any) -> _NoopMetric:  # type: ignore
+        return _NoopMetric()
+
+# Outbound REST call counter (service/endpoint/method/status labeled)
+REST_CALLS = Counter(
+    "rest_calls_total",
+    "Count of outbound REST API calls",
+    ["service", "endpoint", "method", "status"],
+)
+
+# Outbound REST call latency (in seconds)
+REST_LATENCY = Histogram(
+    "rest_call_latency_seconds",
+    "Latency of outbound REST API calls in seconds",
+    ["service", "endpoint", "method"],
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging configuration
+# ──────────────────────────────────────────────────────────────────────────────
 
 _CONFIGURED = False
 
 
 class JsonFormatter(logging.Formatter):
-    """Minimal JSON line formatter: timestamp, level, module, message."""
-
+    """JSON line formatter with timestamp, level, module, message."""
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
-        # timestamp in ISO 8601 with UTC 'Z'
         ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S,%f"
         )[:-3]
@@ -44,7 +87,7 @@ def configure_logging(level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Remove any pre-existing handlers to stop duplicate lines.
+    # Remove pre-existing handlers to prevent duplicate lines.
     for h in list(root.handlers):
         root.removeHandler(h)
 
@@ -52,28 +95,24 @@ def configure_logging(level: int = logging.INFO) -> None:
     handler.setFormatter(JsonFormatter())
     root.addHandler(handler)
 
-    # Prevent libraries from adding noisy extra handlers through propagation.
     logging.captureWarnings(True)
-
     _CONFIGURED = True
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
-    """Return a module logger without adding handlers (uses root’s single handler)."""
+    """Return a module logger that uses the root’s single handler."""
     return logging.getLogger(name if name else __name__)
 
 
 def write_status(msg: str, level: int = logging.INFO) -> None:
-    """Log a status line, attributed to the **caller** (not this helper)."""
+    """Log a status line, attributed to the caller (stacklevel=2 on 3.8+)."""
     logger = logging.getLogger(__name__)
-    # stacklevel=2 attributes module/line to the immediate caller if Python>=3.8
     try:
         logger.log(level, msg, stacklevel=2)
     except TypeError:
-        # Fallback for very old Python: attribute to this module
         logger.log(level, msg)
 
 
 def set_level(level: int) -> None:
-    """Dynamically raise/lower root log level."""
+    """Dynamically adjust root log level."""
     logging.getLogger().setLevel(level)
