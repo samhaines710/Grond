@@ -4,20 +4,26 @@
 This script fetches historical OHLC bars, treasury yields, and option Greeks,
 computes a sliding window of features and labels, and writes the result to
 `data/movement_training_data.csv`.
+
+Changes:
+- Uses centralized JSON logging via utils.logging_utils.configure_logging()
+  (no basicConfig; no duplicate handlers).
+- Keeps /fed/v1/treasury-yields with limit=1&sort=date.desc for latest record.
 """
 
 from __future__ import annotations
 
 import os
-import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
+import logging
 import pandas as pd
 import requests
 
 from config import TICKERS, tz
 from data_ingestion import HistoricalDataLoader
+from utils.logging_utils import configure_logging, get_logger
 from utils import (
     calculate_breakout_prob,
     calculate_recent_move_pct,
@@ -29,16 +35,9 @@ from utils import (
     fetch_option_greeks,
 )
 
-# Logging Setup
-# Break the logging configuration across multiple lines to respect line-length limits
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        '{"timestamp":"%(asctime)s","level":"%(levelname)s",'
-        '"module":"%(module)s","message":"%(message)s"}'
-    ),
-)
-logger = logging.getLogger(__name__)
+# Configure logging once (JSON, singleton)
+configure_logging()
+logger = get_logger(__name__)
 
 # Fetch Treasury Yields once
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
