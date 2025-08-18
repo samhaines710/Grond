@@ -65,7 +65,7 @@ REST_LATENCY = Histogram(
 )
 
 # Rate-limit events (HTTP 429)
-# Labels chosen to match typical usage: REST_429.labels(service, endpoint).inc()
+# Labels: REST_429.labels(service, endpoint).inc()
 REST_429 = Counter(
     "rest_429_total",
     "Count of HTTP 429 (rate-limited) responses from outbound REST calls",
@@ -77,7 +77,6 @@ REST_429 = Counter(
 # ──────────────────────────────────────────────────────────────────────────────
 
 _CONFIGURED = False
-
 
 class JsonFormatter(logging.Formatter):
     """JSON line formatter with timestamp, level, module, message."""
@@ -92,7 +91,6 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
         return json.dumps(payload, ensure_ascii=False)
-
 
 def configure_logging(level: int = logging.INFO) -> None:
     """Install a single JSON StreamHandler on the root logger. Idempotent."""
@@ -114,11 +112,9 @@ def configure_logging(level: int = logging.INFO) -> None:
     logging.captureWarnings(True)
     _CONFIGURED = True
 
-
 def get_logger(name: Optional[str] = None) -> logging.Logger:
     """Return a module logger that uses the root’s single handler."""
     return logging.getLogger(name if name else __name__)
-
 
 def write_status(msg: str, level: int = logging.INFO) -> None:
     """Log a status line, attributed to the caller (stacklevel=2 on 3.8+)."""
@@ -127,7 +123,6 @@ def write_status(msg: str, level: int = logging.INFO) -> None:
         logger.log(level, msg, stacklevel=2)
     except TypeError:
         logger.log(level, msg)
-
 
 def set_level(level: int) -> None:
     """Dynamically adjust root log level."""
