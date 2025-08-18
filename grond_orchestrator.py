@@ -6,6 +6,7 @@ Central orchestrator for the Grond trading system.
 - Exploration gating (NEUTRAL doesn't trade unless ALLOW_NEUTRAL_BANDIT=1).
 - Safety clamp against accidental NEUTRAL execution.
 - Centralized JSON logging configured once at startup.
+- Always includes the 'source' feature for the ML pipeline.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ from utils import (
 from utils.movement import normalize_movement_type
 from utils.messaging import send_telegram
 
-# ─── Configure logging first ───────────────────────────────────────────────────
+# configure logging once
 configure_logging()
 
 # ─── Prometheus metrics ────────────────────────────────────────────────────────
@@ -86,7 +87,7 @@ class GrondOrchestrator:
     def __init__(self) -> None:
         logging.getLogger().setLevel(logging.INFO)
 
-        # Acquire singleton
+        # Acquire singleton lock
         try:
             self._lock_fh = open(_LOCK_FILE, "w")
             fcntl.flock(self._lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -121,6 +122,7 @@ class GrondOrchestrator:
         )
 
     def _decide_movement(self, base_mv: str) -> Tuple[str, bool]:
+        """Apply ε-greedy exploration with gating for NEUTRAL."""
         explored = False
         mv = base_mv
         roll = np.random.rand()
@@ -154,6 +156,7 @@ class GrondOrchestrator:
 
                 bars = reformat_candles(raw)
 
+                # feature computation
                 breakout   = calculate_breakout_prob(bars)
                 recent_pct = calculate_recent_move_pct(bars)
                 vol_ratio  = calculate_volume_ratio(bars)
@@ -169,6 +172,9 @@ class GrondOrchestrator:
                 theta_raw = float(greeks.get("theta", 0.0))
                 theta_day = theta_raw
                 theta_5m  = theta_day / 78.0
+
+                # include 'source' from Greeks for ML pipeline
+                source_val = str(greeks.get("source", "fallback"))
 
                 features: Dict[str, float | str] = {
                     "breakout_prob":      breakout,
@@ -196,13 +202,11 @@ class GrondOrchestrator:
                     "implied_volatility": float(greeks.get("implied_volatility", 0.0)),
                     "theta_day": theta_day,
                     "theta_5m":  theta_5m,
+                    "source": source_val,
                 }
 
                 cls_out = self.classifier.classify(features)
-                raw_mv = cls_out.get("movement_type")
-                base_mv = normalize_movement_type(raw_mv)
-                if raw_mv != base_mv:
-                    write_status(f"[{_INSTANCE_ID}] Normalized movement_type {raw_mv!r} → {base_mv}")
+                base_mv = normalize_movement_type(cls_out.get("movement_type"))
 
                 mv, explored = self._decide_movement(base_mv)
                 if explored:
@@ -214,7 +218,7 @@ class GrondOrchestrator:
                 strat = self.logic.execute_strategy(mv, context)
                 SIGNALS_PROCESSED.labels(ticker=ticker, movement_type=mv).inc()
 
-                # Safety clamp: NEUTRAL never executes if neutral-bandit is disabled
+                # safety clamp: NEUTRAL never executes if neutral-bandit is disabled
                 action = strat.get("action", "REVIEW")
                 if mv == "NEUTRAL" and not _ALLOW_NEUTRAL_BANDIT:
                     if action not in ("AVOID", "REVIEW"):
