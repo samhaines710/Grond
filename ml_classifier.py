@@ -1,134 +1,224 @@
 """
-Wrapper around a pre-trained pipeline for movement classification.
+ML Classifier for movement_type prediction.
 
-Loads an sklearn pipeline (with a final XGBoost classifier) from disk,
-optionally downloading from S3 if missing. Uses the pipeline's RAW input
-schema (feature_names_in_) and safely fills any missing inputs with
-defaults so prediction doesn't crash if a feature is absent.
+Key hardening for NumPy 2.0 / scikit‑learn OneHotEncoder:
+- Safe np.isnan shim: returns False for non‑numeric/object arrays instead of raising TypeError.
+- Strict column alignment to pipeline.feature_names_in_ (if present).
+- Deterministic filling for missing inputs (incl. categorical 'source').
+- Returns both 'movement_type' and class 'probs' in [CALL, PUT, NEUTRAL] order.
+
+Environment:
+- MODEL_URI (e.g., s3://bucket/path/model.joblib)
+- AWS creds via standard env if MODEL_URI is s3://
 """
 
 from __future__ import annotations
 
-import logging
+import io
 import os
-from typing import Any, Dict, List
-
-import joblib
+import re
+import sys
+import json
+import time
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+import joblib
 import numpy as np
 import pandas as pd
+from typing import Any, Dict, List, Tuple
 
-# Local model path (inside the container)
-DEFAULT_MODEL_PATH = "/app/models/xgb_classifier.pipeline.joblib"
-MODEL_PATH = os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH)
+from utils.logging_utils import get_logger, write_status, configure_logging
 
-# S3 settings for auto-download if file is missing
-S3_BUCKET = os.getenv("S3_BUCKET")
-S3_MODEL_KEY = os.getenv("S3_MODEL_KEY", "models/xgb_classifier.pipeline.joblib")
+# ensure logging is configured once
+configure_logging()
+logger = get_logger(__name__)
 
-# Logger
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter(
-        '{"timestamp":"%(asctime)s","level":"%(levelname)s","module":"%(module)s","message":"%(message)s"}'
-    ))
-    logger.addHandler(_h)
+# ──────────────────────────────────────────────────────────────────────────────
+# NumPy isnan shim (NumPy 2.0 object/string arrays raise TypeError)
+# ──────────────────────────────────────────────────────────────────────────────
 
+try:
+    _orig_isnan = np.isnan  # type: ignore[attr-defined]
+except Exception:
+    _orig_isnan = None  # type: ignore
 
-def _download_from_s3(bucket: str, key: str, dest: str) -> None:
-    """Download the model artifact from S3 to the local path."""
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+def _isnan_safe(x: Any):
+    """Return isnan(x) when x is numeric; for object/string inputs return False/zeros."""
+    if _orig_isnan is None:
+        if isinstance(x, np.ndarray):
+            return np.zeros(x.shape, dtype=bool)
+        return False
+    try:
+        return _orig_isnan(x)  # works for numeric arrays and scalars
+    except TypeError:
+        if isinstance(x, np.ndarray):
+            return np.zeros(x.shape, dtype=bool)
+        return False
+
+# monkey‑patch numpy.isnan globally; safe for our process
+np.isnan = _isnan_safe  # type: ignore
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+CALL_LABEL = "CALL"
+PUT_LABEL = "PUT"
+NEU_LABEL = "NEUTRAL"
+
+ORDERED_LABELS = [CALL_LABEL, PUT_LABEL, NEU_LABEL]
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    m = re.match(r"^s3://([^/]+)/(.+)$", uri)
+    if not m:
+        raise ValueError(f"Invalid S3 URI: {uri}")
+    return m.group(1), m.group(2)
+
+def _download_from_s3(s3_uri: str) -> bytes:
+    bucket, key = _parse_s3_uri(s3_uri)
+    write_status(f"Downloading model from {s3_uri}")
     s3 = boto3.client("s3")
-    logger.info(f"Downloading model from s3://{bucket}/{key}")
-    s3.download_file(bucket, key, dest)
-    logger.info("Model downloaded successfully.")
+    buf = io.BytesIO()
+    s3.download_fileobj(bucket, key, buf)
+    buf.seek(0)
+    write_status("Model downloaded successfully.")
+    return buf.read()
 
+def _load_pipeline(model_uri: str):
+    write_status(f"Loading ML pipeline from {model_uri}")
+    if model_uri.startswith("s3://"):
+        data = _download_from_s3(model_uri)
+        pipe = joblib.load(io.BytesIO(data))
+    else:
+        pipe = joblib.load(model_uri)
+    write_status("ML pipeline loaded successfully.")
+    return pipe
+
+def _coerce_val(v: Any) -> Any:
+    """Try to coerce numerics to float; leave strings as str; fallback safe."""
+    if v is None:
+        return np.nan
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v)
+    if isinstance(v, (bool, np.bool_)):
+        return float(bool(v))
+    return str(v)
+
+def _ensure_frame(features: Dict[str, Any]) -> pd.DataFrame:
+    """Build a one‑row DataFrame with coerced values."""
+    row = {k: _coerce_val(v) for k, v in features.items()}
+    return pd.DataFrame([row])
+
+def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Reindex df to match pipeline.feature_names_in_ if present.
+    Fill known missing fields deterministically.
+    Returns (df_aligned, filled_cols_list).
+    """
+    filled: List[str] = []
+    expected = list(getattr(pipeline, "feature_names_in_", []) or list(df.columns))
+
+    DEFAULTS: Dict[str, Any] = {
+        # categorical
+        "source": "fallback",
+        "time_of_day": "MIDDAY",
+        # numeric defaults
+        "breakout_prob": 0.0,
+        "recent_move_pct": 0.0,
+        "volume_ratio": 1.0,
+        "rsi": 50.0,
+        "corr_dev": 0.0,
+        "skew_ratio": 1.0,
+        "yield_spike_2year": 0.0,
+        "yield_spike_10year": 0.0,
+        "yield_spike_30year": 0.0,
+        "delta": 0.0,
+        "gamma": 0.0,
+        "theta": 0.0,
+        "vega": 0.0,
+        "rho": 0.0,
+        "vanna": 0.0,
+        "vomma": 0.0,
+        "charm": 0.0,
+        "veta": 0.0,
+        "speed": 0.0,
+        "zomma": 0.0,
+        "color": 0.0,
+        "implied_volatility": 0.0,
+        "theta_day": 0.0,
+        "theta_5m": 0.0,
+    }
+
+    for col in expected:
+        if col not in df.columns:
+            df[col] = DEFAULTS.get(col, 0.0)
+            filled.append(col)
+
+    df = df.reindex(columns=expected)
+
+    for cat_col in ("source", "time_of_day"):
+        if cat_col in df.columns:
+            df[cat_col] = df[cat_col].astype(str)
+
+    if filled:
+        write_status(f"Filled missing model inputs with defaults: {filled}")
+
+    return df, filled
+
+def _map_class_index_to_label(classes: np.ndarray, idx: int) -> str:
+    """Map estimator.classes_ value at index idx to canonical label."""
+    val = classes[idx]
+    try:
+        ival = int(val)
+        mapping = {0: CALL_LABEL, 1: PUT_LABEL, 2: NEU_LABEL}
+        if ival in mapping:
+            return mapping[ival]
+    except Exception:
+        pass
+    sval = str(val).upper()
+    if sval in {CALL_LABEL, PUT_LABEL, NEU_LABEL}:
+        return sval
+    return NEU_LABEL
+
+def _extract_probs_in_order(classes: np.ndarray, proba_row: np.ndarray) -> List[float]:
+    """Return probabilities in [CALL, PUT, NEUTRAL] order regardless of estimator.classes_ order."""
+    idx_map: Dict[str, int] = {}
+    for i, c in enumerate(classes):
+        idx_map[_map_class_index_to_label(classes, i)] = i
+    p_call = float(proba_row[idx_map.get(CALL_LABEL, 0)])
+    p_put  = float(proba_row[idx_map.get(PUT_LABEL, 1 if len(proba_row) > 1 else 0)])
+    p_neu  = float(proba_row[idx_map.get(NEU_LABEL, 2 if len(proba_row) > 2 else 0)])
+    return [p_call, p_put, p_neu]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public classifier
+# ──────────────────────────────────────────────────────────────────────────────
 
 class MLClassifier:
-    """
-    ML-based movement classifier using a pre-trained sklearn Pipeline.
-    It relies on `pipeline.feature_names_in_` for the RAW input columns.
-    """
+    def __init__(self) -> None:
+        model_uri = os.getenv("MODEL_URI", "s3://bucketbuggypie/models/xgb_classifier.pipeline.joblib")
+        self.pipeline = _load_pipeline(model_uri)
 
-    def __init__(self, model_path: str = MODEL_PATH) -> None:
-        self.model_path = model_path
-
-        # Ensure model exists (download if configured)
-        if not os.path.exists(self.model_path):
-            if S3_BUCKET:
-                try:
-                    _download_from_s3(S3_BUCKET, S3_MODEL_KEY, self.model_path)
-                except (ClientError, BotoCoreError) as exc:
-                    raise FileNotFoundError(f"Could not obtain model from S3: {exc}") from exc
-            else:
-                raise FileNotFoundError(f"Model file not found at: {self.model_path}")
-
-        logger.info(f"Loading ML pipeline from {self.model_path}")
-        self.pipeline = joblib.load(self.model_path)
-        logger.info("ML pipeline loaded successfully.")
-
-        # RAW input schema expected by the pipeline's preprocessor
-        cols = getattr(self.pipeline, "feature_names_in_", None)
-        if cols is None or len(cols) == 0:
-            raise AttributeError("Pipeline missing feature_names_in_. Re-export the model with sklearn>=1.0.")
-        self.input_cols: List[str] = list(cols)
-
-        # NOTE: Some artifacts also store transformed feature names in `feature_names`.
-        # Those are post-encoding and NOT what we should pass as inputs. We keep them
-        # only for reference.
-        self.transformed_cols: List[str] = list(getattr(self.pipeline, "feature_names", []) or [])
-
-    # ---- Defaults for any missing inputs -------------------------------------
-    def _default_for(self, col: str) -> Any:
-        if col == "time_of_day":
-            # Categorical bucket; orchestrator typically provides a string like "MORNING"
-            return "OFF_HOURS"
-        # numeric default
-        return 0.0
-
-    def classify(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def classify(self, features: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Classify a single sample and return movement type and expected move percentage.
-
-        Parameters
-        ----------
-        data : dict
-            Raw features; keys SHOULD match pipeline.feature_names_in_. Any absent
-            keys are filled with safe defaults.
-
-        Returns
-        -------
-        dict: {"movement_type": <label>, "expected_move_pct": <prob*100>}
+        Classify a single feature dict.
+        Returns:
+            {
+              "movement_type": "CALL"|"PUT"|"NEUTRAL",
+              "probs": [p_call, p_put, p_neutral]
+            }
         """
-        # Build row aligned to RAW input schema
-        row = {}
-        missing = []
-        for col in self.input_cols:
-            if col in data and data[col] is not None:
-                row[col] = data[col]
-            else:
-                row[col] = self._default_for(col)
-                missing.append(col)
-
-        if missing:
-            logger.info(f"Filled missing model inputs with defaults: {missing}")
-
-        df = pd.DataFrame([row], columns=self.input_cols)
+        df = _ensure_frame(features)
+        df, _ = _align_columns_for_pipeline(df, self.pipeline)
 
         proba = self.pipeline.predict_proba(df)[0]
-        try:
-            classes = self.pipeline.named_steps["xgb"].classes_
-        except Exception:
-            # Some pipelines store classes_ on the overall pipeline
-            classes = getattr(self.pipeline, "classes_", None)
-            if classes is None:
-                raise AttributeError("Could not locate classifier classes_ in the pipeline.")
+        classes = getattr(self.pipeline, "classes_", None)
+        if classes is None:
+            # fallback: get from final estimator
+            final_est = getattr(self.pipeline, "steps", [[None, None]])[-1][1]
+            classes = getattr(final_est, "classes_", np.array([CALL_LABEL, PUT_LABEL, NEU_LABEL]))
 
-        idx = int(np.argmax(proba))
-        return {
-            "movement_type": classes[idx],
-            "expected_move_pct": float(proba[idx] * 100.0),
-        }
+        label_idx = int(np.argmax(proba))
+        label = _map_class_index_to_label(classes, label_idx)
+        probs = _extract_probs_in_order(classes, proba)
+
+        return {"movement_type": label, "probs": probs}
