@@ -1,4 +1,4 @@
-  #!/usr/bin/env python3
+#!/usr/bin/env python3
 """Prepare training data for movement classification.
 
 This script fetches historical OHLC bars, treasury yields, and option Greeks,
@@ -43,14 +43,12 @@ logger = get_logger(__name__)
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 YIELDS_ENDPOINT = "https://api.polygon.io/fed/v1/treasury-yields"
 
-
 def fetch_treasury_yields(date: str | None = None) -> Dict[str, Any]:
     """Fetch treasury yields for a specific date (or latest) from Polygon."""
     params: Dict[str, Any] = {"apiKey": POLYGON_API_KEY}
     if date:
         params["date"] = date
     else:
-        # IMPORTANT: when no date is specified, get the most recent record
         params["limit"] = 1
         params["sort"] = "date.desc"
 
@@ -63,7 +61,6 @@ def fetch_treasury_yields(date: str | None = None) -> Dict[str, Any]:
     record = results[0]
     logger.info('Fetched treasury yields for date=%s', record.get("date"))
     return record
-
 
 # Cache yields once
 YIELDS = fetch_treasury_yields()
@@ -79,21 +76,18 @@ HIST_DAYS = int(os.getenv("HIST_DAYS", "30"))
 LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "12"))
 LOOKAHEAD_BARS = int(os.getenv("LOOKAHEAD_BARS", "1"))
 
-
 def extract_features_and_label(symbol: str) -> pd.DataFrame:
     """
     Fetch historical bars and compute sliding-window features and labels for a symbol.
 
     Returns a DataFrame of features (including yields and Greeks) plus movement_type.
     """
-    # 1) Fetch bars
     end = datetime.now(tz)
     start = end - timedelta(days=HIST_DAYS)
     loader = HistoricalDataLoader()
     raw_bars = loader.fetch_bars(symbol, start, end)
     logger.info('Fetched %d bars for %s over %d days', len(raw_bars), symbol, HIST_DAYS)
 
-    # 2) Build DataFrame
     df = pd.DataFrame(
         [
             {
@@ -123,21 +117,16 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
     )
     df.set_index("dt", inplace=True)
 
-    # 3) Hoist yields + Greeks
     ys2 = float(YIELDS.get("yield_2_year", 0.0))
     ys10 = float(YIELDS.get("yield_10_year", 0.0))
     ys30 = float(YIELDS.get("yield_30_year", 0.0))
     greeks = fetch_option_greeks(symbol)
     logger.info(
         "Using yields (2y=%s,10y=%s,30y=%s) and Greeks for %s",
-        ys2,
-        ys10,
-        ys30,
-        symbol,
+        ys2, ys10, ys30, symbol,
     )
 
     records: List[Dict[str, Any]] = []
-    # 4) Slide window
     for i in range(LOOKBACK_BARS, len(df) - LOOKAHEAD_BARS):
         window = df.iloc[i - LOOKBACK_BARS:i]
         current = df.iloc[i]
@@ -158,7 +147,6 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
             **greeks,
         }
 
-        # Label
         next_bar = df.iloc[i + LOOKAHEAD_BARS]
         delta = (next_bar["close"] - current["close"]) / current["close"]
         if delta > 0:
@@ -168,15 +156,13 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
         else:
             feat["movement_type"] = "NEUTRAL"
 
-        # explicit theta scaling
         theta_raw = float(greeks.get("theta", 0.0))
         feat["theta_day"] = theta_raw
-        feat["theta_5m"] = theta_raw / 78.0  # ~78 5-min bars in regular session
+        feat["theta_5m"] = theta_raw / 78.0
 
         records.append(feat)
 
     return pd.DataFrame(records)
-
 
 def main() -> None:
     """Generate training data for all tickers and write to CSV."""
@@ -196,7 +182,6 @@ def main() -> None:
     full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
     full.to_csv(OUTPUT_PATH, index=False)
     logger.info('✅ Saved %d rows to %s', len(full), OUTPUT_PATH)
-
 
 if __name__ == "__main__":
     main()
