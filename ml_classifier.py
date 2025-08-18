@@ -1,9 +1,9 @@
 """
 ML Classifier for movement_type prediction.
 
-Key hardening for NumPy 2.0 / scikit‑learn OneHotEncoder:
-- Safe np.isnan shim: returns False for non‑numeric/object arrays instead of raising TypeError.
-- Strict column alignment to pipeline.feature_names_in_ (if present).
+Key hardening for NumPy 2.0 / scikit-learn OneHotEncoder:
+- Safe np.isnan shim: returns False for non-numeric/object arrays instead of raising TypeError.
+- Strict column alignment to pipeline.feature_names_in_ (if present) without boolean-evaluating arrays.
 - Deterministic filling for missing inputs (incl. categorical 'source').
 - Returns both 'movement_type' and class 'probs' in [CALL, PUT, NEUTRAL] order.
 
@@ -17,9 +17,6 @@ from __future__ import annotations
 import io
 import os
 import re
-import sys
-import json
-import time
 import boto3
 import joblib
 import numpy as np
@@ -28,12 +25,12 @@ from typing import Any, Dict, List, Tuple
 
 from utils.logging_utils import get_logger, write_status, configure_logging
 
-# ensure logging is configured once
+# Ensure logging once
 configure_logging()
 logger = get_logger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NumPy isnan shim (NumPy 2.0 object/string arrays raise TypeError)
+# NumPy isnan shim (NumPy 2.0 object/string arrays raise TypeError)
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -54,18 +51,21 @@ def _isnan_safe(x: Any):
             return np.zeros(x.shape, dtype=bool)
         return False
 
-# monkey‑patch numpy.isnan globally; safe for our process
+# Monkey-patch numpy.isnan in-process (safe for our runtime)
 np.isnan = _isnan_safe  # type: ignore
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilities
+# Labels
 # ──────────────────────────────────────────────────────────────────────────────
 
 CALL_LABEL = "CALL"
-PUT_LABEL = "PUT"
-NEU_LABEL = "NEUTRAL"
-
+PUT_LABEL  = "PUT"
+NEU_LABEL  = "NEUTRAL"
 ORDERED_LABELS = [CALL_LABEL, PUT_LABEL, NEU_LABEL]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# S3 helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _parse_s3_uri(uri: str) -> Tuple[str, str]:
     m = re.match(r"^s3://([^/]+)/(.+)$", uri)
@@ -93,6 +93,10 @@ def _load_pipeline(model_uri: str):
     write_status("ML pipeline loaded successfully.")
     return pipe
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature-frame utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
 def _coerce_val(v: Any) -> Any:
     """Try to coerce numerics to float; leave strings as str; fallback safe."""
     if v is None:
@@ -104,18 +108,48 @@ def _coerce_val(v: Any) -> Any:
     return str(v)
 
 def _ensure_frame(features: Dict[str, Any]) -> pd.DataFrame:
-    """Build a one‑row DataFrame with coerced values."""
+    """Build a one-row DataFrame with coerced values."""
     row = {k: _coerce_val(v) for k, v in features.items()}
     return pd.DataFrame([row])
 
+def _expected_features_for_pipeline(pipeline, df_cols) -> List[str]:
+    """
+    Determine the expected feature order for the pipeline without evaluating
+    any ndarray in a boolean context (avoids ambiguous truth-value errors).
+    """
+    # 1) Try pipeline-level attribute
+    feat = getattr(pipeline, "feature_names_in_", None)
+    if feat is not None:
+        try:
+            return list(feat)
+        except Exception:
+            pass
+
+    # 2) Try step-level attributes (e.g., preprocessor/ColumnTransformer)
+    try:
+        steps = getattr(pipeline, "steps", None)
+        if steps:
+            for _, step in steps:
+                step_feat = getattr(step, "feature_names_in_", None)
+                if step_feat is not None:
+                    try:
+                        return list(step_feat)
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # 3) Fallback: current DataFrame columns
+    return list(df_cols)
+
 def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Reindex df to match pipeline.feature_names_in_ if present.
+    Reindex df to match pipeline expected features.
     Fill known missing fields deterministically.
     Returns (df_aligned, filled_cols_list).
     """
     filled: List[str] = []
-    expected = list(getattr(pipeline, "feature_names_in_", []) or list(df.columns))
+    expected = _expected_features_for_pipeline(pipeline, df.columns)
 
     DEFAULTS: Dict[str, Any] = {
         # categorical
@@ -155,6 +189,7 @@ def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFram
 
     df = df.reindex(columns=expected)
 
+    # Ensure categorical dtype→str to avoid encoder issues
     for cat_col in ("source", "time_of_day"):
         if cat_col in df.columns:
             df[cat_col] = df[cat_col].astype(str)
@@ -163,6 +198,10 @@ def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFram
         write_status(f"Filled missing model inputs with defaults: {filled}")
 
     return df, filled
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Class/label utilities
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _map_class_index_to_label(classes: np.ndarray, idx: int) -> str:
     """Map estimator.classes_ value at index idx to canonical label."""
@@ -182,7 +221,7 @@ def _map_class_index_to_label(classes: np.ndarray, idx: int) -> str:
 def _extract_probs_in_order(classes: np.ndarray, proba_row: np.ndarray) -> List[float]:
     """Return probabilities in [CALL, PUT, NEUTRAL] order regardless of estimator.classes_ order."""
     idx_map: Dict[str, int] = {}
-    for i, c in enumerate(classes):
+    for i, _ in enumerate(classes):
         idx_map[_map_class_index_to_label(classes, i)] = i
     p_call = float(proba_row[idx_map.get(CALL_LABEL, 0)])
     p_put  = float(proba_row[idx_map.get(PUT_LABEL, 1 if len(proba_row) > 1 else 0)])
@@ -213,7 +252,7 @@ class MLClassifier:
         proba = self.pipeline.predict_proba(df)[0]
         classes = getattr(self.pipeline, "classes_", None)
         if classes is None:
-            # fallback: get from final estimator
+            # Some sklearn Pipelines keep classes_ on the final estimator
             final_est = getattr(self.pipeline, "steps", [[None, None]])[-1][1]
             classes = getattr(final_est, "classes_", np.array([CALL_LABEL, PUT_LABEL, NEU_LABEL]))
 
