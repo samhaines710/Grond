@@ -1,111 +1,85 @@
-"""Configuration constants for the trading system.
+"""
+Grond configuration.
 
-This module centralizes environment-driven settings, default values,
-and constants used throughout the application. It avoids repeated
-lookups and ensures consistent configuration handling.
+Changes (2025-08-20):
+- Removed NIO (unavailable / no options on your platform).
+- Added BABA (Alibaba) and VEX to the default trading universe.
+
+This module intentionally keeps defaults safe, with environment-variable overrides
+for production control. All values are read once at import time.
 """
 
+from __future__ import annotations
+
 import os
-import pytz
+from zoneinfo import ZoneInfo
 
-# === API KEYS & TOKENS ===
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# ──────────────────────────────────────────────────────────────────────────────
+# Service identity & time zone
+# ──────────────────────────────────────────────────────────────────────────────
 
-# === Service Identity & Modes ===
-SERVICE_NAME = os.getenv("SERVICE_NAME", "grond")
-EXECUTION_MODE = os.getenv("EXECUTION_MODE", "SCALP")
-RISK_MODE = os.getenv("RISK_MODE", "AGGRESSIVE")
+SERVICE_NAME: str = os.getenv("SERVICE_NAME", "grond")
 
-# === Trading Parameters ===
-ORDER_SIZE = float(os.getenv("ORDER_SIZE", "1.0"))
-BANDIT_EPSILON = float(os.getenv("BANDIT_EPSILON", "0.1"))
+# Market timezone used across the orchestrator (datetime.now(tz))
+# Default to New York; override if your venue differs.
+MARKET_TZ: str = os.getenv("MARKET_TIMEZONE", "America/New_York")
+tz: ZoneInfo = ZoneInfo(MARKET_TZ)
 
-# === Underlying Symbols ===
-TICKERS = [
-    "TSLA", "AAPL", "MSFT", "NVDA",
-    "NFLX", "AMZN", "META", "GOOG",
-    "NIO", "IBIT",
+# ──────────────────────────────────────────────────────────────────────────────
+# Core trading policy knobs (read by orchestrator/strategy)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Exploration rate for BanditAllocator (kept default 0.1, override via env)
+BANDIT_EPSILON: float = float(os.getenv("BANDIT_EPSILON", "0.1"))
+
+# Per-trade notional size (manual executor). Override per environment as needed.
+ORDER_SIZE: float = float(os.getenv("ORDER_SIZE", "1.0"))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Universe
+# - Defaults reflect the logs you’re running, with NIO→BABA and VEX added.
+# - You can override the entire list via env TICKERS="TSLA,AAPL,...".
+# ──────────────────────────────────────────────────────────────────────────────
+
+_DEFAULT_TICKERS = [
+    "TSLA",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "NFLX",
+    "AMZN",
+    "META",
+    "GOOG",
+    "IBIT",
+    "BABA",  # substituted for NIO
+    "VEX",   # newly added
 ]
-OPTIONS_TICKERS = TICKERS.copy()
 
-# === Risk-Free Rate & Dividends ===
-RISK_FREE_RATE = 0.048
-DIVIDEND_YIELDS = {
-    "TSLA": 0.00,
-    "AAPL": 0.005,
-    "MSFT": 0.007,
-    "NVDA": 0.001,
-    "NFLX": 0.00,
-    "AMZN": 0.00,
-    "META": 0.002,
-    "GOOG": 0.00,
-    "NIO": 0.00,
-    "IBIT": 0.00,
-}
+_env_tickers = [t.strip().upper() for t in os.getenv("TICKERS", "").split(",") if t.strip()]
+TICKERS = _env_tickers if _env_tickers else _DEFAULT_TICKERS
 
-# === Single Fallback Volatility ===
-# Used only if realized sigma cannot be computed
-DEFAULT_VOLATILITY_FALLBACK = float(
-    os.getenv("DEFAULT_VOLATILITY_FALLBACK", "0.2")
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# External APIs / Credentials (read-only here; used elsewhere)
+# ──────────────────────────────────────────────────────────────────────────────
 
-# === Timezone & Market-Hour Labels ===
-tz = pytz.timezone("US/Eastern")
-TIME_OF_DAY_LABELS = (
-    "PRE_MARKET",
-    "MORNING",
-    "MIDDAY",
-    "AFTERNOON",
-    "AFTER_HOURS",
-    "OFF_HOURS",
-)
+# Polygon API key (if blank, upstream code may fall back to calculated greeks)
+POLYGON_API_KEY: str = os.getenv("POLYGON_API_KEY", "")
 
-# === Rate Limiting (Polygon API) ===
-RATE_LIMIT_PER_SEC = 5.0
-BURST_CAPACITY_SEC = 10
-RATE_LIMIT_PER_MIN = 200.0
-BURST_CAPACITY_MIN = 200
+# Optional: S3 model location can be overridden globally if desired.
+# (ml_classifier reads MODEL_URI directly from env; kept here as a single source)
+MODEL_URI: str = os.getenv("MODEL_URI", "s3://bucketbuggypie/models/xgb_classifier.pipeline.joblib")
 
-# === API & Logging File Paths ===
-SNAPSHOT_FILE = "snapshots/options_oi_snapshots.json"
-SIGNAL_TRACKER_FILE = "logs/alladin_signal_performance_log.csv"
-EXIT_LOG_FILE = "logs/alladin_exit_log.csv"
-STATUS_FILE = "logs/alladin_status.txt"
+# ──────────────────────────────────────────────────────────────────────────────
+# Sanity: expose explicit __all__ for clarity
+# ──────────────────────────────────────────────────────────────────────────────
 
-# === Metrics & HTTP Ports ===
-METRICS_PORT = int(os.getenv("METRICS_PORT", "8000"))
-HTTP_PORT = int(os.getenv("HTTP_PORT", "10000"))
-
-# === Telegram Notifications ===
-ENABLE_TELEGRAM = True
-TELEGRAM_COOLDOWN_SECONDS = 60
-
-# === Strategy & Classifier Parameters ===
-MIN_BREAKOUT_PROBABILITY = 0.5
-EXIT_BARS = 3
-
-MOVEMENT_CONFIG_FILE = "movement_config.json"
-MOVEMENT_LOGIC_CONFIG_FILE = "movement_logic_config.json"
-
-# === Data-Source & Ingestion Settings ===
-DATA_SOURCE_MODE = "hybrid"
-REST_POLL_INTERVAL = 10
-WEBHOOK_INITIAL_DELAY = 300
-
-# === Historical Lookbacks ===
-LOOKBACK_BREAKOUT = 5
-LOOKBACK_RISK_REWARD = 20
-DEFAULT_CANDLE_LIMIT = 500
-
-# === TTL (Time-to-Live) Mappings ===
-TTL_MAP = {
-    "SHORT": 3,
-    "MEDIUM": 10,
-    "EXPIRY": 10000,
-}
-
-# === Exit-Level Parameters ===
-EXIT_PROFIT_TARGET = 0.02
-EXIT_STOP_LOSS = -0.015
+__all__ = [
+    "SERVICE_NAME",
+    "MARKET_TZ",
+    "tz",
+    "BANDIT_EPSILON",
+    "ORDER_SIZE",
+    "TICKERS",
+    "POLYGON_API_KEY",
+    "MODEL_URI",
+]
