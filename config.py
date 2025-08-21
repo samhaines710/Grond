@@ -108,5 +108,5 @@ TTL_MAP = {
 }
 
 # === Exit-Level Parameters ===
-EXIT_PROFIT_TARGET = 0.02
-EXIT_STOP_LOSS = -0.015
+EXIT_PROFIT_TARGET = 0.06
+EXIT_STOP_LOSS = -0.035
