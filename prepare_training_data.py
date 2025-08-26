@@ -72,9 +72,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
 
 # Parameters (CI / env override)
-HIST_DAYS = int(os.getenv("HIST_DAYS", "90"))
-LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "18"))
-LOOKAHEAD_BARS = int(os.getenv("LOOKAHEAD_BARS", "2"))
+HIST_DAYS = int(os.getenv("HIST_DAYS", "45"))
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "24"))
+LOOKAHEAD_BARS = int(os.getenv("LOOKAHEAD_BARS", "1"))
 
 def extract_features_and_label(symbol: str) -> pd.DataFrame:
     """
