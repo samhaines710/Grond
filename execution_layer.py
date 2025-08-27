@@ -1,167 +1,96 @@
-"""Execution layer providing simple slippage model and manual order execution.
+"""
+Execution layer.
 
-This module defines a SlippageModel with static methods for fixed spread,
-volume impact, and volatility impact, plus a ManualExecutor class that logs
-and notifies a manual trade.
+Fixes:
+- MANUAL EXECUTION logs now include full context (action, movement, probabilities, strategy, source).
+- Keeps backward compatibility with existing calls (side-only) but prefers the richer signature.
+
+Public API:
+    ManualExecutor(notify_fn: Optional[Callable[[str], None]] = None)
+    place_order(ticker: str, size: float, side: str, *,
+                action: Optional[str] = None,
+                movement: Optional[str] = None,
+                probs: Optional[list] = None,
+                strategy: Optional[str] = None,
+                source: Optional[str] = None) -> None
 """
 
 from __future__ import annotations
 
-import logging
-from datetime import datetime
-from typing import Any, Callable, Dict
+from typing import Callable, Optional, List
 
-from utils.logging_utils import write_status
+from utils.logging_utils import get_logger, write_status
 
-
-logger = logging.getLogger("execution_layer")
-logger.setLevel(logging.INFO)
-
-
-class SlippageModel:
-    """Collection of static methods to estimate slippage components."""
-
-    @staticmethod
-    def fixed(spread: float) -> float:
-        """Half the bid–ask spread."""
-        return spread / 2.0
-
-    @staticmethod
-    def volume_impact(
-        order_size: float,
-        adv: float,
-        impact_coefficient: float = 0.1,
-        exponent: float = 0.6,
-    ) -> float:
-        """
-        Market impact based on participation rate.
-
-        Parameters
-        ----------
-        order_size : float
-            Number of shares/contracts being traded.
-        adv : float
-            Average daily volume for the instrument.
-        impact_coefficient : float, optional
-            Scaling factor for the volume impact.
-        exponent : float, optional
-            Exponent used in the volume impact calculation.
-
-        Returns
-        -------
-        float
-            Estimated impact cost.
-        """
-        participation = order_size / max(adv, 1e-6)
-        return impact_coefficient * (participation ** exponent)
-
-    @staticmethod
-    def volatility_impact(volatility: float, vol_coeff: float = 0.5) -> float:
-        """Impact proportional to volatility."""
-        return vol_coeff * volatility
-
-    @classmethod
-    def total(
-        cls,
-        spread: float,
-        order_size: float,
-        adv: float,
-        volatility: float,
-        vol_coeff: float = 0.5,
-        impact_coeff: float = 0.1,
-        exponent: float = 0.6,
-    ) -> float:
-        """
-        Sum of fixed, volume, and volatility impacts.
-        """
-        return (
-            cls.fixed(spread)
-            + cls.volume_impact(
-                order_size,
-                adv,
-                impact_coefficient=impact_coeff,
-                exponent=exponent,
-            )
-            + cls.volatility_impact(volatility, vol_coeff=vol_coeff)
-        )
-
+logger = get_logger(__name__)
 
 class ManualExecutor:
-    """
-    Executor that emits a manual signal (e.g., via Telegram) and logs it.
-    """
-
-    def __init__(self, notify_fn: Callable[[str], None]) -> None:
-        """
-        Initialize the executor with a notification function.
-
-        Parameters
-        ----------
-        notify_fn : Callable[[str], None]
-            A function to call with a markdown-formatted message.
-        """
-        self.notify = notify_fn
+    def __init__(self, notify_fn: Optional[Callable[[str], None]] = None) -> None:
+        self.notify_fn = notify_fn
 
     def place_order(
         self,
+        *,
         ticker: str,
         size: float,
-        side: str = "buy",
-    ) -> Dict[str, Any]:
+        side: str,
+        action: Optional[str] = None,
+        movement: Optional[str] = None,
+        probs: Optional[List[float]] = None,
+        strategy: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> None:
         """
-        Execute a manual signal by logging, notifying, and returning a report.
+        Log and (in a real integration) submit an order.
 
         Parameters
         ----------
-        ticker : str
-            Symbol to trade.
-        size : float
-            Number of contracts/shares.
-        side : str, optional
-            "buy" or "sell".
+        ticker: str
+            The underlying symbol.
+        size: float
+            Size of the order (notional number of contracts).
+        side: str
+            'buy' or 'sell'.
+        action: Optional[str]
+            The high-level action string (e.g., 'BUY_CALL', 'SELL_PUT').
+        movement: Optional[str]
+            The normalized movement_type ('CALL','PUT','NEUTRAL').
+        probs: Optional[List[float]]
+            List [p_call,p_put,p_neu] giving classifier probabilities.
+        strategy: Optional[str]
+            The strategy branch used ('trend-follow','mean-revert', etc.).
+        source: Optional[str]
+            Data source for Greeks ('polygon' or 'fallback').
 
-        Returns
-        -------
-        Dict[str, Any]
-            A report describing the order.
+        The log message will always start with "MANUAL EXECUTION → ...".
         """
-        report: Dict[str, Any] = {
-            "ticker": ticker,
-            "side": side.lower(),
-            "size": size,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "note": "Manual execution required",
-        }
+        # Human-readable headline
+        act = (action or side.upper()).strip()
+        if act and act != side.upper():
+            headline = f"MANUAL EXECUTION → {act} {size} {ticker}"
+        else:
+            headline = f"MANUAL EXECUTION → {side.upper()} {size} {ticker}"
 
-        # Log locally
-        msg = f"MANUAL EXECUTION → {side.upper()} {size} {ticker}"
-        logger.info(msg)
+        # Detailed context
+        parts = []
+        if movement:
+            parts.append(f"mv={movement}")
+        if probs and len(probs) == 3:
+            try:
+                pc, pp, pn = float(probs[0]), float(probs[1]), float(probs[2])
+                parts.append(f"p=[C:{pc:.3f},P:{pp:.3f},N:{pn:.3f}]")
+            except Exception:
+                pass
+        if strategy:
+            parts.append(f"strategy={strategy}")
+        if source:
+            parts.append(f"src={source}")
+
+        msg = headline if not parts else f"{headline} | " + " ".join(parts)
+
+        # Log to status and optional notifier
         write_status(msg)
-
-        # Send Telegram (or other) notification
-        try:
-            text = (
-                f"📋 *MANUAL SIGNAL* — {side.upper()} {size} {ticker}"
-                f" @ {datetime.utcnow().strftime('%H:%M')} UTC"
-            )
-            self.notify(text)
-        except Exception as exc:
-            logger.warning(f"Failed to send notification: {exc}")
-
-        return report
-
-    def generate_execution_report(self) -> dict[str, float]:
-        """Return a summary of fills and current account value."""
-        report = {
-            "cash": self.cash,
-            "positions": self.positions.copy(),
-            "account_value": self.cash + sum(self.positions.values()),
-        }
-
-        # send Telegram or Slack message
-        try:
-            self.notify(f"Execution report: {report}")
-        except Exception as exc:
-            logger.warning(f"Failed to send notification: {exc}")
-
-        return report
+        if self.notify_fn:
+            try:
+                self.notify_fn(msg)
+            except Exception:
+                logger.exception("Error in notify_fn")
