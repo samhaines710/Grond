@@ -72,7 +72,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
 
 # Parameters (CI / env override)
-HIST_DAYS = int(os.getenv("HIST_DAYS", "45"))
+HIST_DAYS = int(os.getenv("HIST_DAYS", "60"))
 LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "24"))
 LOOKAHEAD_BARS = int(os.getenv("LOOKAHEAD_BARS", "1"))
 
