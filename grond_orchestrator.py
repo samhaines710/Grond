@@ -58,7 +58,7 @@ from utils.messaging import send_telegram
 
 configure_logging()
 
-# Prometheus counters (ensure labels provided)
+# Prometheus counters
 SIGNALS_PROCESSED = Counter(
     f"{SERVICE_NAME}_signals_total",
     "Number of signals generated",
@@ -70,11 +70,11 @@ EXECUTIONS = Counter(
     ["ticker", "action"],
 )
 
-# Exploration settings (kept as-is)
+# Exploration settings
 _EPSILON = float(os.getenv("BANDIT_EPSILON", str(BANDIT_EPSILON)))
 _ALLOW_NEUTRAL_BANDIT = os.getenv("ALLOW_NEUTRAL_BANDIT", "0").lower() in {"1", "true", "yes"}
 
-# Budget & dedup (unchanged)
+# Budget & dedup
 _MAX_TRADES = int(os.getenv("MAX_TRADES_PER_CYCLE", "3"))
 _MAX_BUYS   = int(os.getenv("MAX_BUYS_PER_CYCLE", "2"))
 _MAX_SELLS  = int(os.getenv("MAX_SELLS_PER_CYCLE", "2"))
@@ -132,7 +132,7 @@ class GrondOrchestrator:
         )
         self.executor = ManualExecutor(notify_fn=send_telegram)
 
-        # Dedup cache per ticker
+        # Dedup cache
         self._last_exec: Dict[str, Tuple[str, float]] = {}
 
         write_status(
