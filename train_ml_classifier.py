@@ -117,7 +117,7 @@ def parse_args():
     p.add_argument("--label-col",      default="movement_type")
     p.add_argument("--model-dir",      default="models")
     p.add_argument("--model-filename", default="xgb_classifier.pipeline.joblib")
-    p.add_argument("--test-size",      type=float, default=0.2)
+    p.add_argument("--test-size",      type=float, default=0.25)
     p.add_argument("--random-state",   type=int,   default=42)
     return p.parse_args()
 
